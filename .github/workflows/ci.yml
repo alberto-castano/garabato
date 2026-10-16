@@ -50,6 +50,10 @@ jobs:
           fi
           openssl cms -help >/dev/null 2>&1
           openssl list -providers -provider legacy | grep -q legacy
+      - name: Install independent PDF validators
+        # Poppler pdfsig and NSS certutil. pyHanko runs through uvx at a pinned version.
+        run: brew list poppler >/dev/null 2>&1 || brew install poppler
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
       - run: bun install --frozen-lockfile
       - run: bun run typecheck
       - run: bun run lint
