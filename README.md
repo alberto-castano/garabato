@@ -17,7 +17,7 @@ Supported PKCS#12 encryption: PBES2 with AES or 3DES, and legacy SHA-1 3DES or R
 
 ## Development
 
-Use Bun 1.4.0 and Node 24.14.1 or a compatible current Node release.
+Use Bun 1.4.0 (`packageManager` in package.json) and Node 24.14.1 (`.node-version`).
 
 ```sh
 bun install --frozen-lockfile
@@ -34,6 +34,20 @@ bun run test
 
 Tests require OpenSSL 3.4 or later with the `cms` command and the legacy provider. They generate disposable certificates and verify signed bytes independently.
 OpenSSL is a test dependency; the application does not invoke it.
+On macOS, the system `openssl` is LibreSSL. Install Homebrew `openssl@3` and put its `bin` directory first on `PATH`.
+
+### Continuous integration
+
+[CI](.github/workflows/ci.yml) runs on pull requests, pushes to `main`, and weekly. Its jobs have read-only repository access.
+
+| Job | Runner | Checks |
+| --- | --- | --- |
+| Typecheck, lint, and test | macOS 15 (arm64), Bun 1.4.0, Node 24.14.1, Homebrew OpenSSL 3.4+ | Frozen-lockfile install, OpenSSL version check, `typecheck`, `lint`, `test` |
+| Dependency audit | Ubuntu 24.04 | `bun audit`; any advisory fails the job |
+| Secret scan | Ubuntu 24.04 | gitleaks over the full Git history |
+
+macOS 15 is the only supported operating system for tests and the first release. Other systems are not tested.
+Do not suppress audit or secret-scan failures; track each known failure in an issue.
 
 `bun run build` compiles the application. `bun run start` opens that compiled output.
 Installer packaging, app signing, and notarization are not configured yet.
