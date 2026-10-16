@@ -1,6 +1,11 @@
-import { createHash, createPrivateKey, type KeyObject } from "node:crypto";
+import {
+  createHash,
+  createPrivateKey,
+  type KeyObject,
+  X509Certificate,
+} from "node:crypto";
 import { pdflibAddPlaceholder } from "@signpdf/placeholder-pdf-lib";
-import forge from "node-forge";
+import * as asn1js from "asn1js";
 import {
   PDFArray,
   PDFDict,
@@ -12,8 +17,10 @@ import {
   PDFStream,
   PDFString,
 } from "pdf-lib";
+import * as pkijs from "pkijs";
 import type { CertificateInfo } from "../shared/contracts";
 import { signDetached } from "./cms";
+import { type Pkcs12Contents, readPkcs12 } from "./pkcs12";
 
 export const MAX_PDF_BYTES = 25 * 1024 * 1024;
 export const MAX_P12_BYTES = 2 * 1024 * 1024;
@@ -80,22 +87,30 @@ export async function inspectPdf(pdf: Buffer): Promise<{ pageCount: number }> {
   return { pageCount: (await loadUnsignedPdf(pdf)).getPageCount() };
 }
 
-function certificateName(fields: forge.pki.CertificateField[]): string {
-  return fields
-    .filter((field) => typeof field.value === "string")
-    .map(
-      (field) =>
-        `${field.shortName ?? field.name ?? field.type}=${Number(field.valueTagClass) === forge.asn1.Type.UTF8 ? forge.util.decodeUtf8(String(field.value)) : String(field.value)}`,
+// X.500 attribute short names for display (RFC 4519).
+const attributeNames: Record<string, string> = {
+  "2.5.4.3": "CN",
+  "2.5.4.4": "SN",
+  "2.5.4.5": "serialNumber",
+  "2.5.4.6": "C",
+  "2.5.4.7": "L",
+  "2.5.4.8": "ST",
+  "2.5.4.10": "O",
+  "2.5.4.11": "OU",
+  "2.5.4.12": "title",
+  "2.5.4.42": "GN",
+  "2.5.4.97": "organizationIdentifier",
+  "1.2.840.113549.1.9.1": "E",
+};
+
+function certificateName(name: pkijs.RelativeDistinguishedNames): string {
+  return name.typesAndValues
+    .flatMap(({ type, value }) =>
+      value instanceof asn1js.BaseStringBlock
+        ? [`${attributeNames[type] ?? type}=${value.getValue()}`]
+        : [],
     )
     .join(", ");
-}
-
-function certificateDer(certificate: forge.pki.Certificate): Buffer {
-  // Forge keeps the parsed TBSCertificate, so this is the original DER.
-  return Buffer.from(
-    forge.asn1.toDer(forge.pki.certificateToAsn1(certificate)).getBytes(),
-    "binary",
-  );
 }
 
 function readCertificate(
@@ -108,71 +123,67 @@ function readCertificate(
   key: KeyObject;
 } {
   checkSize(p12, MAX_P12_BYTES, "Certificate file");
-  let container: forge.pkcs12.Pkcs12Pfx;
-  try {
-    container = forge.pkcs12.pkcs12FromAsn1(
-      forge.asn1.fromDer(p12.toString("binary")),
-      true,
-      password,
-    );
-  } catch {
-    throw new Error(
-      "Cannot open the certificate. Check the password and use a supported RSA .p12 or .pfx file.",
-    );
-  }
-  const bags = container.safeContents.flatMap((content) => content.safeBags);
-  const keys = bags.filter(
-    (bag) =>
-      bag.type === forge.pki.oids.pkcs8ShroudedKeyBag ||
-      bag.type === forge.pki.oids.keyBag,
+  const unreadable = new Error(
+    "Cannot open the certificate. Check the password and use a supported RSA .p12 or .pfx file.",
   );
-  if (keys.length !== 1)
+  let container: Pkcs12Contents;
+  try {
+    container = readPkcs12(p12, password);
+  } catch {
+    throw unreadable;
+  }
+  if (container.keys.length !== 1)
     throw new Error(
       "The certificate file must contain exactly one private key.",
     );
-  const keyBag = keys[0];
-  const key = keyBag.key;
-  if (!key || !("n" in key) || !("e" in key))
+  const [keyBag] = container.keys;
+  let key: KeyObject;
+  let certificates: X509Certificate[];
+  try {
+    key = createPrivateKey({ key: keyBag.pkcs8, format: "der", type: "pkcs8" });
+    certificates = container.certificates.map(
+      (der) => new X509Certificate(der),
+    );
+  } catch {
+    throw unreadable;
+  }
+  if (key.asymmetricKeyType !== "rsa")
     throw new Error("Only RSA private keys are supported.");
-  if (keyBag.type !== forge.pki.oids.pkcs8ShroudedKeyBag) {
+  if (!keyBag.encrypted) {
     throw new Error(
       "This private-key container is unsupported. Export a password-protected .p12 or .pfx file.",
     );
   }
-  const matching = bags.flatMap((bag) => {
-    const certificate = bag.cert;
-    if (!certificate) return [];
-    const publicKey = certificate.publicKey;
-    return "n" in publicKey &&
-      "e" in publicKey &&
-      publicKey.n.compareTo(key.n) === 0 &&
-      publicKey.e.compareTo(key.e) === 0
-      ? [certificate]
-      : [];
-  });
+  const matching = certificates.filter((certificate) =>
+    certificate.checkPrivateKey(key),
+  );
   if (matching.length !== 1)
     throw new Error("The private key must match exactly one certificate.");
-  const certificate = matching[0];
+  const signer = matching[0].raw;
+  let certificate: pkijs.Certificate;
+  try {
+    certificate = pkijs.Certificate.fromBER(new Uint8Array(signer));
+  } catch {
+    throw unreadable;
+  }
+  const notBefore = certificate.notBefore.value;
+  const notAfter = certificate.notAfter.value;
   const now = Date.now();
-  if (now < certificate.validity.notBefore.getTime())
+  if (now < notBefore.getTime())
     throw new Error("The certificate is not valid yet.");
-  if (now > certificate.validity.notAfter.getTime())
-    throw new Error("The certificate has expired.");
-  const signer = certificateDer(certificate);
+  if (now > notAfter.getTime()) throw new Error("The certificate has expired.");
   return {
     info: {
-      subject: certificateName(certificate.subject.attributes),
-      issuer: certificateName(certificate.issuer.attributes),
-      validFrom: certificate.validity.notBefore.toISOString(),
-      validTo: certificate.validity.notAfter.toISOString(),
+      subject: certificateName(certificate.subject),
+      issuer: certificateName(certificate.issuer),
+      validFrom: notBefore.toISOString(),
+      validTo: notAfter.toISOString(),
       fingerprint: createHash("sha256").update(signer).digest("hex"),
     },
     signer,
     // Embed the whole container chain, as Adobe and EU validators expect.
-    certificates: bags.flatMap((bag) =>
-      bag.cert ? [certificateDer(bag.cert)] : [],
-    ),
-    key: createPrivateKey(forge.pki.privateKeyToPem(key)),
+    certificates: container.certificates,
+    key,
   };
 }
 
