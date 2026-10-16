@@ -8,12 +8,21 @@ Versions are pinned in package.json and bun.lock.
 - `@signpdf/placeholder-pdf-lib`: 3.3.0, released 2025-12-29. The [project](https://github.com/vbuch/node-signpdf) had activity on 2026-10-13 and approximately 942 stars. MIT licensed.
 - `pdf-lib`: 1.17.1, released 2021-11-06. The [repository](https://github.com/Hopding/pdf-lib) was last pushed in July 2024 and had approximately 8,661 stars. Its age is a maintenance risk. Used for unsigned PDF preparation only, with independent signature tests.
 - `pkijs` 3.4.1 (released 2026-09-20) and `asn1js` 3.0.10: the [PeculiarVentures](https://github.com/PeculiarVentures/PKI.js) PKI libraries, BSD-3-Clause, approximately 1,401 stars, last pushed 2026-09-30. Used to build the CMS SignedData. Node `crypto` creates the RSA signature.
-- `node-forge`: 1.4.0, released 2026-03-24. The [repository](https://github.com/digitalbazaar/forge) had activity in September 2026 and approximately 5,341 stars. Used only for PKCS#12 parsing.
 
-`bun audit` reports one high-severity advisory: [GHSA-86w9-cpqp-85rv](https://github.com/advisories/GHSA-86w9-cpqp-85rv).
-It affects node-forge RSA PKCS#1 v1.5 signature verification through 1.4.0. No patched version was listed at inspection.
-Garabato does not call forge's RSA verification or certificate-chain verification functions. Tests use OpenSSL for independent verification.
-Do not introduce verification through forge. The PKCS#12 reader is planned to move to pkijs, which removes node-forge.
+Garabato reads PKCS#12 files itself in `src/main/pkcs12.ts`. pkijs parses the ASN.1 structures; Node `crypto` derives keys, checks the MAC, and decrypts.
+pkijs alone opens only PBES2 files. Older Windows and OpenSSL exports use the legacy RFC 7292 SHA-1 3DES and RC2 algorithms.
+Garabato therefore owns two small, standard pieces, each tested against fixed vectors:
+
+- The RFC 7292 appendix B key derivation, tested against published Bouncy Castle vectors.
+- RC2-CBC decryption (RFC 2268) in `src/main/rc2.ts`. Node's OpenSSL 3 default provider has no RC2. Tests use OpenSSL `enc` ciphertexts.
+
+Supported: password MACs with SHA-1 or SHA-2; PBES2 with PBKDF2 and AES-CBC or 3DES; SHA-1 PBE with 3DES, RC2-128, or RC2-40.
+Key derivation is limited to 1,000,000 iterations so that a hostile file cannot stall the main process.
+Files without a MAC are accepted, as before; the private key must still decrypt with the password.
+Tests export OpenSSL files with the default AES, `-legacy`, 3DES-only, and unencrypted-certificate settings, with a non-ASCII password.
+An Electron 44.8.0 smoke test (BoringSSL) opened and signed with legacy and AES files.
+
+node-forge was removed. `bun audit` reports no vulnerabilities. Its GHSA-86w9-cpqp-85rv advisory no longer applies.
 
 `src/main/cms.ts` builds a detached SHA-256 RSA SignedData with the contentType, signingTime, and messageDigest signed attributes, in that order.
 It embeds the container certificates unchanged and takes the signer identifier from the parsed certificate issuer, which keeps its original DER.
