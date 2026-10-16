@@ -2,6 +2,8 @@
 
 An Electron, TypeScript, React, and shadcn/ui application for local PDF signing. No Java runtime or AutoFirma installation is required.
 
+See the [development roadmap](docs/ROADMAP.md) for prioritized issues, acceptance criteria, and dependencies.
+
 ## First milestone
 
 - Choose an unsigned PDF and an RSA `.p12` or `.pfx` certificate.
