@@ -4,19 +4,18 @@ import {
   type KeyObject,
   X509Certificate,
 } from "node:crypto";
-import { pdflibAddPlaceholder } from "@signpdf/placeholder-pdf-lib";
-import * as asn1js from "asn1js";
 import {
   PDFArray,
   PDFDict,
   PDFDocument,
+  PDFInvalidObject,
   PDFName,
   PDFNumber,
   type PDFObject,
-  PDFRef,
   PDFStream,
   PDFString,
-} from "pdf-lib";
+} from "@cantoo/pdf-lib";
+import * as asn1js from "asn1js";
 import * as pkijs from "pkijs";
 import type { CertificateInfo } from "../shared/contracts";
 import { signDetached } from "./cms";
@@ -24,6 +23,8 @@ import { type Pkcs12Contents, readPkcs12 } from "./pkcs12";
 
 export const MAX_PDF_BYTES = 25 * 1024 * 1024;
 export const MAX_P12_BYTES = 2 * 1024 * 1024;
+// Room for a 16 KiB CMS signature, hex-encoded.
+const SIGNATURE_HEX_LENGTH = 32768;
 
 export type { CertificateInfo } from "../shared/contracts";
 
@@ -213,79 +214,92 @@ export async function signPdf(
     for (let suffix = 2; fieldNames.has(signatureName); suffix += 1) {
       signatureName = `GarabatoSignature${suffix}`;
     }
-    // The placeholder helper uses get(), not lookup(), for these form entries.
-    // Resolve indirect objects so it preserves the existing field tree and flags.
-    const form = document.catalog.lookupMaybe(PDFName.of("AcroForm"), PDFDict);
-    if (form) {
-      const fields = form.lookupMaybe(PDFName.of("Fields"), PDFArray);
-      const flags = form.lookupMaybe(PDFName.of("SigFlags"), PDFNumber);
-      if (fields) form.set(PDFName.of("Fields"), fields);
-      if (flags) form.set(PDFName.of("SigFlags"), flags);
-    }
     const signingTime = new Date();
-    pdflibAddPlaceholder({
-      pdfDoc: document,
-      reason: "",
-      contactInfo: "",
-      location: "",
-      // Identity comes from the embedded signing certificate. The helper's
-      // PDFString.of(name) does not escape PDF syntax or encode Unicode safely.
-      name: "",
-      signingTime,
-      signatureLength: 32768,
-      appName: "Garabato",
-    });
-    const updatedForm = document.catalog.lookup(
-      PDFName.of("AcroForm"),
-      PDFDict,
+    // Fixed-width placeholders: filling them keeps the serialized PDF length.
+    const byteRangePlaceholder = `/ByteRange [0 ${"9".repeat(10)} ${"9".repeat(10)} ${"9".repeat(10)}]`;
+    const contentsPlaceholder = `/Contents <${"0".repeat(SIGNATURE_HEX_LENGTH)}>`;
+    // Identity comes from the embedded certificate, so the dictionary has no
+    // text metadata. Raw bytes stop pdf-lib from reformatting it or moving it
+    // into an object stream.
+    const signatureBody = [
+      "<<",
+      "/Type /Sig",
+      "/Filter /Adobe.PPKLite",
+      "/SubFilter /adbe.pkcs7.detached",
+      byteRangePlaceholder,
+      contentsPlaceholder,
+      `/M ${PDFString.fromDate(signingTime).toString()}`,
+      "/Prop_Build << /Filter << /Name /Adobe.PPKLite >> /App << /Name /Garabato >> >>",
+      ">>",
+    ].join("\n");
+    const { context } = document;
+    const signatureRef = context.register(
+      PDFInvalidObject.of(Buffer.from(signatureBody, "latin1")),
     );
-    const updatedFields = updatedForm.lookup(PDFName.of("Fields"), PDFArray);
-    const signatureWidget = updatedFields.lookup(
-      updatedFields.size() - 1,
-      PDFDict,
+    const page = document.getPage(0);
+    const widget = context.register(
+      context.obj({
+        Type: "Annot",
+        Subtype: "Widget",
+        FT: "Sig",
+        Rect: [0, 0, 0, 0],
+        V: signatureRef,
+        T: PDFString.of(signatureName),
+        F: 4, // Print
+        P: page.ref,
+        // An empty appearance stream, required for PDF/A.
+        AP: {
+          N: context.register(
+            context.formXObject([], { BBox: [0, 0, 0, 0], Resources: {} }),
+          ),
+        },
+      }),
     );
-    signatureWidget.set(PDFName.of("T"), PDFString.of(signatureName));
+    // lookupMaybe() resolves indirect arrays, so existing trees stay in place.
+    const annotations = page.node.lookupMaybe(PDFName.of("Annots"), PDFArray);
+    if (annotations) annotations.push(widget);
+    else page.node.set(PDFName.of("Annots"), context.obj([widget]));
+    let form = document.catalog.lookupMaybe(PDFName.of("AcroForm"), PDFDict);
+    if (!form) {
+      form = context.obj({});
+      document.catalog.set(PDFName.of("AcroForm"), context.register(form));
+    }
+    const fields = form.lookupMaybe(PDFName.of("Fields"), PDFArray);
+    if (fields) fields.push(widget);
+    else form.set(PDFName.of("Fields"), context.obj([widget]));
+    // Add SignaturesExist (1) and AppendOnly (2) to any existing flags.
+    const flags = form.lookupMaybe(PDFName.of("SigFlags"), PDFNumber);
+    form.set(
+      PDFName.of("SigFlags"),
+      PDFNumber.of((flags?.asNumber() ?? 0) | 3),
+    );
     const prepared = Buffer.from(
       await document.save({ useObjectStreams: false }),
     );
-    const reference = signatureWidget.get(PDFName.of("V"));
-    if (!(reference instanceof PDFRef))
-      throw new Error("Missing signature object");
-    const object = document.context.lookup(reference);
-    if (!object) throw new Error("Missing signature object body");
-    const body = Buffer.alloc(object.sizeInBytes());
-    object.copyBytesInto(body, 0);
     // Match the complete generated object, including its reference, not arbitrary
     // /ByteRange text elsewhere in an input string or stream.
-    const signatureObject = Buffer.concat([
-      Buffer.from(
-        `${reference.objectNumber} ${reference.generationNumber} obj\n`,
-      ),
-      body,
-      Buffer.from("\nendobj"),
-    ]);
+    const header = `${signatureRef.objectNumber} ${signatureRef.generationNumber} obj\n`;
+    const signatureObject = Buffer.from(
+      `${header}${signatureBody}\nendobj`,
+      "latin1",
+    );
     const offset = prepared.indexOf(signatureObject);
     if (offset < 0 || prepared.indexOf(signatureObject, offset + 1) !== -1) {
       throw new Error("Signature object is not unique");
     }
-    // This dictionary was generated above with fixed, empty text metadata.
-    const range = /\/ByteRange\s*\[[^\]]+\]/.exec(
-      signatureObject.toString("binary"),
-    );
-    const contents = signatureObject.indexOf("/Contents <");
-    if (!range || contents < 0)
-      throw new Error("Missing signature placeholder");
-    const open = contents + "/Contents ".length;
-    const close = signatureObject.indexOf(">", open);
-    if (close <= open) throw new Error("Invalid signature placeholder");
-    const start = offset + open;
-    const end = offset + close + 1;
+    const bodyOffset = offset + header.length;
+    // start is the "<" of the signature slot; end follows its ">".
+    const start =
+      bodyOffset +
+      signatureBody.indexOf(contentsPlaceholder) +
+      "/Contents ".length;
+    const end = start + SIGNATURE_HEX_LENGTH + 2;
     const byteRange = `/ByteRange [0 ${start} ${end} ${prepared.length - end}]`;
-    if (byteRange.length > range[0].length)
+    if (byteRange.length > byteRangePlaceholder.length)
       throw new Error("Byte range is too long");
     prepared.write(
-      byteRange.padEnd(range[0].length, " "),
-      offset + range.index,
+      byteRange.padEnd(byteRangePlaceholder.length, " "),
+      bodyOffset + signatureBody.indexOf(byteRangePlaceholder),
       "ascii",
     );
     const signature = signDetached({
@@ -296,10 +310,10 @@ export async function signPdf(
       ]),
       signingTime,
     });
-    const capacity = close - open - 1;
     const hex = signature.toString("hex");
-    if (hex.length > capacity) throw new Error("Signature is too large");
-    prepared.write(hex.padEnd(capacity, "0"), start + 1, "ascii");
+    if (hex.length > SIGNATURE_HEX_LENGTH)
+      throw new Error("Signature is too large");
+    prepared.write(hex.padEnd(SIGNATURE_HEX_LENGTH, "0"), start + 1, "ascii");
     return prepared;
   } catch {
     throw new Error(
