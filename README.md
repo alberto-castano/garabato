@@ -36,13 +36,17 @@ Tests require OpenSSL 3.4 or later with the `cms` command and the legacy provide
 OpenSSL is a test dependency; the application does not invoke it.
 On macOS, the system `openssl` is LibreSSL. Install Homebrew `openssl@3` and put its `bin` directory first on `PATH`.
 
+Interoperability tests also need Poppler `pdfsig`, NSS `certutil`, and `uvx` (`brew install poppler uv`).
+They run pyHanko through `uvx` at a pinned version, so the first run downloads it.
+See [interoperability results](docs/interoperability.md) for the supported-input matrix.
+
 ### Continuous integration
 
 [CI](.github/workflows/ci.yml) runs on pull requests, pushes to `main`, and weekly. Its jobs have read-only repository access.
 
 | Job | Runner | Checks |
 | --- | --- | --- |
-| Typecheck, lint, and test | macOS 15 (arm64), Bun 1.4.0, Node 24.14.1, Homebrew OpenSSL 3.4+ | Frozen-lockfile install, OpenSSL version check, `typecheck`, `lint`, `test` |
+| Typecheck, lint, and test | macOS 15 (arm64), Bun 1.4.0, Node 24.14.1, Homebrew OpenSSL 3.4+ and Poppler, uv | Frozen-lockfile install, OpenSSL version check, `typecheck`, `lint`, `test` |
 | Dependency audit | Ubuntu 24.04 | `bun audit`; any advisory fails the job |
 | Secret scan | Ubuntu 24.04 | gitleaks over the full Git history |
 
@@ -65,7 +69,7 @@ PDF parsing and signing currently run in the main process; large or complex inpu
 
 See [dependency decisions and audit results](docs/dependencies.md).
 The test suite checks cryptographic output, file preservation, session cleanup, IPC authorization, and UI state transitions.
-A native application launch, visual review, production build, and installer tests remain to be performed.
+The native development build and Adobe Acrobat validation were checked manually ([results](docs/interoperability.md#manual-checks)). Visual review, production build, and installer tests remain to be performed.
 
 ## Architecture
 
