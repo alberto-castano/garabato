@@ -1,6 +1,5 @@
-import { createHash } from "node:crypto";
+import { createHash, createPrivateKey, type KeyObject } from "node:crypto";
 import { pdflibAddPlaceholder } from "@signpdf/placeholder-pdf-lib";
-import { P12Signer } from "@signpdf/signer-p12";
 import forge from "node-forge";
 import {
   PDFArray,
@@ -14,6 +13,7 @@ import {
   PDFString,
 } from "pdf-lib";
 import type { CertificateInfo } from "../shared/contracts";
+import { signDetached } from "./cms";
 
 export const MAX_PDF_BYTES = 25 * 1024 * 1024;
 export const MAX_P12_BYTES = 2 * 1024 * 1024;
@@ -90,10 +90,23 @@ function certificateName(fields: forge.pki.CertificateField[]): string {
     .join(", ");
 }
 
-export function inspectCertificate(
+function certificateDer(certificate: forge.pki.Certificate): Buffer {
+  // Forge keeps the parsed TBSCertificate, so this is the original DER.
+  return Buffer.from(
+    forge.asn1.toDer(forge.pki.certificateToAsn1(certificate)).getBytes(),
+    "binary",
+  );
+}
+
+function readCertificate(
   p12: Buffer,
   password: string,
-): CertificateInfo {
+): {
+  info: CertificateInfo;
+  signer: Buffer;
+  certificates: Buffer[];
+  key: KeyObject;
+} {
   checkSize(p12, MAX_P12_BYTES, "Certificate file");
   let container: forge.pkcs12.Pkcs12Pfx;
   try {
@@ -145,18 +158,29 @@ export function inspectCertificate(
     throw new Error("The certificate is not valid yet.");
   if (now > certificate.validity.notAfter.getTime())
     throw new Error("The certificate has expired.");
-  const der = forge.asn1
-    .toDer(forge.pki.certificateToAsn1(certificate))
-    .getBytes();
+  const signer = certificateDer(certificate);
   return {
-    subject: certificateName(certificate.subject.attributes),
-    issuer: certificateName(certificate.issuer.attributes),
-    validFrom: certificate.validity.notBefore.toISOString(),
-    validTo: certificate.validity.notAfter.toISOString(),
-    fingerprint: createHash("sha256")
-      .update(Buffer.from(der, "binary"))
-      .digest("hex"),
+    info: {
+      subject: certificateName(certificate.subject.attributes),
+      issuer: certificateName(certificate.issuer.attributes),
+      validFrom: certificate.validity.notBefore.toISOString(),
+      validTo: certificate.validity.notAfter.toISOString(),
+      fingerprint: createHash("sha256").update(signer).digest("hex"),
+    },
+    signer,
+    // Embed the whole container chain, as Adobe and EU validators expect.
+    certificates: bags.flatMap((bag) =>
+      bag.cert ? [certificateDer(bag.cert)] : [],
+    ),
+    key: createPrivateKey(forge.pki.privateKeyToPem(key)),
   };
+}
+
+export function inspectCertificate(
+  p12: Buffer,
+  password: string,
+): CertificateInfo {
+  return readCertificate(p12, password).info;
 }
 
 export async function signPdf(
@@ -165,7 +189,7 @@ export async function signPdf(
   password: string,
 ): Promise<Buffer> {
   const document = await loadUnsignedPdf(pdf);
-  inspectCertificate(p12, password);
+  const certificate = readCertificate(p12, password);
   try {
     const fieldNames = new Set(
       document
@@ -253,14 +277,14 @@ export async function signPdf(
       offset + range.index,
       "ascii",
     );
-    const signer = new P12Signer(p12, {
-      passphrase: password,
-      asn1StrictParsing: true,
-    });
-    const signature = await signer.sign(
-      Buffer.concat([prepared.subarray(0, start), prepared.subarray(end)]),
+    const signature = signDetached({
+      ...certificate,
+      content: Buffer.concat([
+        prepared.subarray(0, start),
+        prepared.subarray(end),
+      ]),
       signingTime,
-    );
+    });
     const capacity = close - open - 1;
     const hex = signature.toString("hex");
     if (hex.length > capacity) throw new Error("Signature is too large");
