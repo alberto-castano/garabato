@@ -39,20 +39,24 @@ function checkSize(bytes: Buffer, limit: number, label: string): void {
 async function loadUnsignedPdf(bytes: Buffer): Promise<PDFDocument> {
   checkSize(bytes, MAX_PDF_BYTES, "PDF");
   let document: PDFDocument;
+  let pageCount: number;
+  let form: PDFDict | undefined;
+  // A PDF can load but still lack a page tree or have a malformed form.
   try {
     document = await PDFDocument.load(bytes, {
       updateMetadata: false,
       throwOnInvalidObject: true,
     });
+    pageCount = document.getPageCount();
+    form = document.catalog.lookupMaybe(PDFName.of("AcroForm"), PDFDict);
   } catch {
     throw new Error("Cannot read this PDF. Select a valid, unencrypted PDF.");
   }
   if (document.isEncrypted)
     throw new Error("Encrypted PDFs are not supported.");
-  if (document.getPageCount() === 0)
+  if (pageCount === 0)
     throw new Error("The PDF must contain at least one page.");
   // pdf-lib's getForm() deletes XFA data. Reject it before any form access.
-  const form = document.catalog.lookupMaybe(PDFName.of("AcroForm"), PDFDict);
   if (form?.has(PDFName.of("XFA"))) {
     throw new Error("XFA forms are not supported. Choose a standard PDF.");
   }
