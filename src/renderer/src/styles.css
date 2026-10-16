@@ -1,0 +1,53 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--card);
+  --color-popover-foreground: var(--foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--secondary);
+  --color-accent-foreground: var(--foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--border);
+  --color-ring: var(--primary);
+  --radius-sm: 0.375rem;
+  --radius-md: 0.5rem;
+  --radius-lg: 0.75rem;
+  --radius-xl: 1rem;
+}
+
+:root {
+  color-scheme: light;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --background: #f6f5f1;
+  --foreground: #212c28;
+  --card: #ffffff;
+  --card-foreground: #212c28;
+  --primary: #235a48;
+  --primary-foreground: #ffffff;
+  --secondary: #e7eee8;
+  --muted: #efeee9;
+  --muted-foreground: #606a64;
+  --destructive: #ad302c;
+  --border: #d7ddd5;
+}
+
+@layer base {
+  * { @apply border-border outline-ring/50; }
+  body { @apply m-0 bg-background text-foreground antialiased; }
+  button, input { font: inherit; }
+  button:not(:disabled) { cursor: pointer; }
+  ::selection { background: var(--secondary); }
+}
+
+.wordmark { font-family: Georgia, "Times New Roman", serif; letter-spacing: -0.065em; }

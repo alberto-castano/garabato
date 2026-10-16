@@ -1,0 +1,18 @@
+# Local analysis binaries and downloaded tooling.
+research/autofirma/tools/
+research/autofirma/evidence/*.jar
+research/autofirma/decompiled/
+research/autofirma/upstream/
+research/autofirma/evidence/
+node_modules/
+out/
+coverage/
+.DS_Store
+# Signing identities and local secrets must never be published.
+*.p12
+*.pfx
+*.key
+*.pem
+.env
+.env.*
+!.env.example
