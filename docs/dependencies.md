@@ -1,30 +1,62 @@
 # Dependency decisions
 
-Checked against npm registry metadata and the projects' GitHub repositories on 2026-10-16.
+Checked against npm registry metadata, installed package manifests, and the projects' GitHub repositories on 2026-10-16.
 Versions are pinned in package.json and bun.lock.
 
 ## Signing
 
-- `@signpdf/signer-p12` and `@signpdf/placeholder-pdf-lib`: 3.3.0, released 2025-12-29. The [project](https://github.com/vbuch/node-signpdf) had activity on 2026-10-13 and approximately 942 stars. MIT licensed.
-- `pdf-lib`: 1.17.1, released 2021-11-06. The [repository](https://github.com/Hopding/pdf-lib) was last pushed in July 2024 and had approximately 8,661 stars. Its age is a maintenance risk. Used for unsigned PDF preparation only, with independent signature tests.
-- `node-forge`: 1.4.0, released 2026-03-24. The [repository](https://github.com/digitalbazaar/forge) had activity in September 2026 and approximately 5,341 stars. Used for PKCS#12 parsing and CMS signing through the signpdf signer.
+Runtime signing dependencies. Versions are exact pins. Checked on 2026-10-16.
 
-`bun audit` reports one high-severity advisory: [GHSA-86w9-cpqp-85rv](https://github.com/advisories/GHSA-86w9-cpqp-85rv).
-It affects node-forge RSA PKCS#1 v1.5 signature verification through 1.4.0. No patched version was listed at inspection.
-Garabato does not call forge's RSA verification or certificate-chain verification functions. Tests use OpenSSL for independent verification.
-This limits exposure to the reported path; it does not make the dependency audit clean.
-Do not introduce verification through forge without resolving this advisory. Reassess or replace the dependency before distribution.
+| Package | Version | License | Maintenance | Use |
+| --- | --- | --- | --- | --- |
+| `pkijs` | 3.4.1 (2026-09-20) | BSD-3-Clause | [PeculiarVentures](https://github.com/PeculiarVentures/PKI.js), last push 2026-09-30, about 1,400 stars | CMS SignedData, PKCS#12 and X.509 ASN.1 structures |
+| `asn1js` | 3.0.10 (2026-04-20) | BSD-3-Clause | [PeculiarVentures](https://github.com/PeculiarVentures/ASN1.js) | ASN.1 encoding |
+| `@cantoo/pdf-lib` | 2.11.1 (2026-09-15) | MIT | [Cantoo fork of pdf-lib](https://github.com/cantoo-scribe/pdf-lib), last push 2026-09-11, about 360 stars | PDF parsing, preparation, and saving |
 
-The tracked Bun patch for `@signpdf/signer-p12@3.3.0` preserves the original ASN.1 issuer Name in CMS SignerInfo.
-Forge's attribute serializer otherwise double-encodes UTF-8 and flattens multi-valued RDN groups.
-The patch copies the issuer from the original certificate structure into the generated CMS signer identifier.
-It leaves the original certificate DER, signed attributes, and cryptographic signature unchanged.
-Without the patch, OpenSSL cannot locate the signer certificate for these issuers. Regression tests cover both cases.
-The application also resolves indirect AcroForm entries, selects a unique signature field name, and omits unsafe PDF Name metadata.
-These work around confirmed defects in the pinned PDF placeholder helper. The certificate still supplies the signer identity.
-The application does not use the generic `@signpdf/signpdf` byte scanner: it can mistake PDF string content for a placeholder.
-It locates the complete signature object created by the placeholder helper, checks that the match is unique, and patches only that object's byte range and signature slot.
-All replacements keep the serialized PDF length unchanged. Tests preserve literal `/ByteRange` text in an unrelated object and verify the resulting CMS signature.
+Transitive runtime packages: `pvtsutils` 1.3.6 (MIT), `pvutils` 1.2.0 (MIT), `bytestreamjs` 2.0.1 (BSD-3-Clause), and `@noble/hashes` 1.8.0 (MIT) through pkijs;
+`fflate` 0.8.3, `culori` 4.0.2, `node-html-better-parser` 1.5.9, and `html-entities` 2.6.0 (all MIT) through the PDF library; `tslib` 2.8.1 (0BSD).
+`bun audit` reports no vulnerabilities.
+
+Removed in the #1 stack: `node-forge` (GHSA-86w9-cpqp-85rv, unpatched through 1.4.0), `@signpdf/signer-p12` and its local patch,
+`@signpdf/placeholder-pdf-lib`, and `pdf-lib` 1.17.1 (no release since 2021). Garabato has no patched dependencies.
+
+### Code Garabato owns
+
+These pieces replace dependencies that were unmaintained, vulnerable, or patched. Each follows a public standard and has its own tests.
+
+- `src/main/cms.ts`: detached SHA-256 RSA CMS SignedData (RFC 5652) with the contentType, signingTime, and messageDigest signed attributes, in that order.
+  It embeds the container certificates unchanged. The signer identifier copies the certificate issuer DER, which keeps Unicode and multi-valued RDNs intact.
+- `src/main/pkcs12.ts`: PKCS#12 reader (RFC 7292). pkijs parses the structures; Node `crypto` derives keys, checks the MAC, and decrypts.
+  pkijs alone opens only PBES2 files. Older Windows and OpenSSL exports use the legacy SHA-1 3DES and RC2 algorithms.
+  The appendix B key derivation is tested against published Bouncy Castle vectors.
+- `src/main/rc2.ts`: RC2-CBC decryption (RFC 2268). Node's OpenSSL 3 default provider has no RC2. Tests use OpenSSL `enc` ciphertexts.
+- The signature placeholder in `src/main/signing.ts`: a `/Sig` dictionary with `adbe.pkcs7.detached`, an invisible widget, and AcroForm `SigFlags` 3.
+  The dictionary is written as fixed bytes, so the byte range and signature slot are at known offsets.
+
+PKCS#12 support: password MACs with SHA-1 or SHA-2; PBES2 with PBKDF2 and AES-CBC or 3DES; SHA-1 PBE with 3DES, RC2-128, or RC2-40.
+Key derivation is limited to 1,000,000 iterations so that a hostile file cannot stall the main process.
+Files without a MAC are accepted; the private key must still decrypt with the password.
+
+### PDF handling
+
+The application rejects existing signatures, encrypted PDFs, and XFA forms before it changes the document.
+It selects a unique signature field name and adds the widget to existing field and annotation arrays, including indirect ones.
+The signature dictionary has no text metadata; the certificate supplies the signer identity.
+The application does not scan for placeholders: it locates the complete signature object it wrote, checks that the match is unique,
+and patches only that object's byte range and signature slot. All replacements keep the serialized PDF length unchanged.
+
+### Regression coverage
+
+`tests/signing.test.ts` and `tests/pkcs12.test.ts` cover these risks. Keep the tests when you change signing code or dependencies:
+
+- Unicode, parentheses, and backslashes in certificate subjects.
+- Multi-valued Unicode issuer RDNs in the CMS signer identifier.
+- Form fields and flags stored as indirect objects, and unique signature field names.
+- Byte-range selection when another object contains literal `/ByteRange` text.
+- OpenSSL PKCS#12 exports: default AES, `-legacy`, 3DES-only, and unencrypted certificates, with a non-ASCII password.
+- KDF and RC2 known-answer vectors, and the iteration limit.
+
+On 2026-10-16, Poppler `pdfsig` also reported valid, whole-document signatures for AES and legacy containers. It is not part of the test suite.
 
 ## Desktop and interface
 

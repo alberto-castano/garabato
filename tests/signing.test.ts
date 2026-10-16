@@ -3,7 +3,6 @@ import { generateKeyPairSync } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import forge from "node-forge";
 import {
   PDFArray,
   PDFDict,
@@ -11,8 +10,10 @@ import {
   PDFName,
   PDFNumber,
   PDFString,
-} from "pdf-lib";
-import { beforeAll, describe, expect, it } from "vitest";
+} from "@cantoo/pdf-lib";
+import * as asn1js from "asn1js";
+import * as pkijs from "pkijs";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   inspectCertificate,
   inspectPdf,
@@ -22,134 +23,156 @@ import {
 } from "../src/main/signing";
 
 const password = "disposable-test-password";
-const pair = generateKeyPairSync("rsa", { modulusLength: 2048 });
-const privateKey = forge.pki.privateKeyFromPem(
-  pair.privateKey.export({ type: "pkcs8", format: "pem" }).toString(),
-);
-const publicKey = forge.pki.publicKeyFromPem(
-  pair.publicKey.export({ type: "spki", format: "pem" }).toString(),
-);
+const fixtures = mkdtempSync(join(tmpdir(), "garabato-certificate-test-"));
+let fixtureCount = 0;
 
+afterAll(() => rmSync(fixtures, { recursive: true, force: true }));
+
+function fixturePath(extension: string): string {
+  fixtureCount += 1;
+  return join(fixtures, `fixture-${fixtureCount}.${extension}`);
+}
+
+function openssl(args: string[]): Buffer {
+  const result = spawnSync("openssl", args);
+  if (result.error) throw result.error;
+  if (result.status !== 0) throw new Error(result.stderr.toString());
+  return result.stdout;
+}
+
+function keyFile(type: "rsa" | "ec" = "rsa"): string {
+  const pair =
+    type === "rsa"
+      ? generateKeyPairSync("rsa", { modulusLength: 2048 })
+      : generateKeyPairSync("ec", { namedCurve: "P-256" });
+  const path = fixturePath("key.pem");
+  writeFileSync(
+    path,
+    pair.privateKey.export({ type: "pkcs8", format: "pem" }).toString(),
+    { mode: 0o600 },
+  );
+  return path;
+}
+
+const rsaKey = keyFile();
+const otherRsaKey = keyFile();
+
+function opensslTime(date: Date): string {
+  return `${date.toISOString().replace(/[-:T]/g, "").slice(0, 14)}Z`;
+}
+
+function certificatePem(
+  options: { key?: string; subject?: string; from?: Date; to?: Date } = {},
+): string {
+  const path = fixturePath("cert.pem");
+  openssl([
+    "req",
+    "-x509",
+    "-new",
+    "-key",
+    options.key ?? rsaKey,
+    "-utf8",
+    "-subj",
+    options.subject ?? "/CN=Disposable test certificate",
+    "-not_before",
+    opensslTime(options.from ?? new Date(Date.now() - 60_000)),
+    "-not_after",
+    opensslTime(options.to ?? new Date(Date.now() + 86_400_000)),
+    "-out",
+    path,
+  ]);
+  return path;
+}
+
+/** Exports a PKCS#12 file with OpenSSL. Extra arguments select its algorithms. */
 function certificateFile(
   options: {
+    key?: string;
+    subject?: string;
     from?: Date;
     to?: Date;
-    includeKey?: boolean;
-    mismatch?: boolean;
-    duplicateKey?: boolean;
-    subject?: string;
+    password?: string;
+    args?: string[];
   } = {},
 ): Buffer {
-  const certificate = forge.pki.createCertificate();
-  certificate.publicKey = options.mismatch
-    ? forge.pki.rsa.generateKeyPair(2048).publicKey
-    : publicKey;
-  certificate.serialNumber = "01";
-  certificate.validity.notBefore =
-    options.from ?? new Date(Date.now() - 60_000);
-  certificate.validity.notAfter =
-    options.to ?? new Date(Date.now() + 86_400_000);
-  certificate.setSubject([
-    {
-      name: "commonName",
-      value: options.subject ?? "Disposable test certificate",
-      // Forge expects the ASN.1 tag type here; @types/node-forge calls it Class.
-      valueTagClass: forge.asn1.Type.UTF8 as number as forge.asn1.Class,
-    },
+  const key = options.key ?? rsaKey;
+  const path = fixturePath("p12");
+  openssl([
+    "pkcs12",
+    "-export",
+    "-inkey",
+    key,
+    "-in",
+    certificatePem({ ...options, key }),
+    "-passout",
+    `pass:${options.password ?? password}`,
+    "-out",
+    path,
+    ...(options.args ?? []),
   ]);
-  certificate.setIssuer(certificate.subject.attributes);
-  certificate.sign(privateKey, forge.md.sha256.create());
-  const p12 = forge.pkcs12.toPkcs12Asn1(
-    options.includeKey === false ? null : privateKey,
-    certificate,
-    password,
-    {
-      algorithm: "aes256",
-      count: 2048,
-      useMac: !options.duplicateKey,
-    },
-  );
-  if (options.duplicateKey) duplicateKeyBag(p12);
-  return Buffer.from(forge.asn1.toDer(p12).getBytes(), "binary");
+  return readFileSync(path);
 }
 
-function duplicateKeyBag(node: forge.asn1.Asn1): void {
-  if (Array.isArray(node.value)) {
-    for (const child of [...node.value]) {
-      if (typeof child === "string") continue;
-      const first = Array.isArray(child.value) ? child.value[0] : undefined;
-      if (
-        first &&
-        typeof first !== "string" &&
-        first.type === forge.asn1.Type.OID &&
-        typeof first.value === "string" &&
-        forge.asn1.derToOid(first.value) === forge.pki.oids.pkcs8ShroudedKeyBag
-      ) {
-        node.value.push(child);
-        return;
-      }
-      duplicateKeyBag(child);
-    }
-  } else if (
-    node.type === forge.asn1.Type.OCTETSTRING &&
-    typeof node.value === "string"
-  ) {
-    let nested: forge.asn1.Asn1;
-    try {
-      nested = forge.asn1.fromDer(node.value);
-    } catch {
-      return;
-    }
-    duplicateKeyBag(nested);
-    node.value = forge.asn1.toDer(nested).getBytes();
-  }
+// OpenSSL refuses to export unusual containers, so these build bags directly.
+function shroudedKeyBag(key: string): pkijs.SafeBag {
+  const der = openssl([
+    ...["pkcs8", "-topk8", "-in", key, "-v2", "aes-256-cbc"],
+    ...["-passout", `pass:${password}`, "-outform", "DER"],
+  ]);
+  return new pkijs.SafeBag({
+    bagId: "1.2.840.113549.1.12.10.1.2",
+    bagValue: pkijs.PKCS8ShroudedKeyBag.fromBER(new Uint8Array(der)),
+  });
 }
 
-function multiValuedIssuerFile(): Buffer {
-  const folder = mkdtempSync(join(tmpdir(), "garabato-issuer-test-"));
-  try {
-    const keyPath = join(folder, "key.pem");
-    const certPath = join(folder, "cert.pem");
-    const p12Path = join(folder, "cert.p12");
-    writeFileSync(keyPath, forge.pki.privateKeyToPem(privateKey), {
-      mode: 0o600,
+function plainKeyBag(key: string): pkijs.SafeBag {
+  const der = openssl([
+    "pkcs8",
+    "-topk8",
+    "-in",
+    key,
+    "-nocrypt",
+    "-outform",
+    "DER",
+  ]);
+  return new pkijs.SafeBag({
+    bagId: "1.2.840.113549.1.12.10.1.1",
+    bagValue: pkijs.PrivateKeyInfo.fromBER(new Uint8Array(der)),
+  });
+}
+
+function certificateBag(key = rsaKey): pkijs.SafeBag {
+  const der = openssl([
+    "x509",
+    "-in",
+    certificatePem({ key }),
+    "-outform",
+    "DER",
+  ]);
+  return new pkijs.SafeBag({
+    bagId: "1.2.840.113549.1.12.10.1.3",
+    bagValue: new pkijs.CertBag({
+      certId: "1.2.840.113549.1.9.22.1",
+      certValue: new asn1js.OctetString({ valueHex: new Uint8Array(der) }),
+    }),
+  });
+}
+
+/** Builds an unencrypted PKCS#12 file without a MAC. */
+function containerFile(safeBags: pkijs.SafeBag[]): Buffer {
+  const data = (value: { toSchema(): asn1js.AsnType }) =>
+    new pkijs.ContentInfo({
+      contentType: "1.2.840.113549.1.7.1",
+      content: new asn1js.OctetString({
+        valueHex: value.toSchema().toBER(),
+      }),
     });
-    for (const args of [
-      [
-        "req",
-        "-new",
-        "-x509",
-        "-key",
-        keyPath,
-        "-out",
-        certPath,
-        "-days",
-        "1",
-        "-utf8",
-        "-subj",
-        "/CN=Issuér+OU=Signing",
-      ],
-      [
-        "pkcs12",
-        "-export",
-        "-inkey",
-        keyPath,
-        "-in",
-        certPath,
-        "-out",
-        p12Path,
-        "-passout",
-        `pass:${password}`,
-      ],
-    ]) {
-      const result = spawnSync("openssl", args);
-      if (result.error) throw result.error;
-      if (result.status !== 0) throw new Error(result.stderr.toString());
-    }
-    return readFileSync(p12Path);
-  } finally {
-    rmSync(folder, { recursive: true, force: true });
-  }
+  const authSafe = new pkijs.AuthenticatedSafe({
+    safeContents: [data(new pkijs.SafeContents({ safeBags }))],
+  });
+  return Buffer.from(
+    new pkijs.PFX({ version: 3, authSafe: data(authSafe) }).toSchema().toBER(),
+  );
 }
 
 // OpenSSL verifies both the detached content digest and the CMS signature.
@@ -276,7 +299,7 @@ describe("local PDF signing", () => {
   });
 
   it("keeps PDF syntax valid for Unicode, parentheses, and backslashes in certificate subjects", async () => {
-    const certificate = certificateFile({ subject: "María (Equipo\\" });
+    const certificate = certificateFile({ subject: "/CN=María (Equipo\\\\" });
     expect(inspectCertificate(certificate, password).subject).toBe(
       "CN=María (Equipo\\",
     );
@@ -321,7 +344,7 @@ describe("local PDF signing", () => {
   });
 
   it("preserves a multi-valued Unicode issuer RDN in the CMS signer identifier", async () => {
-    const certificate = multiValuedIssuerFile();
+    const certificate = certificateFile({ subject: "/CN=Issuér+OU=Signing" });
     expect(inspectCertificate(certificate, password).issuer).toContain(
       "Issuér",
     );
@@ -406,17 +429,79 @@ describe("local PDF signing", () => {
 
   it("rejects missing keys and certificates that do not match the private key", () => {
     expect(() =>
-      inspectCertificate(certificateFile({ includeKey: false }), password),
+      inspectCertificate(containerFile([certificateBag()]), password),
     ).toThrow("exactly one private key");
     expect(() =>
-      inspectCertificate(certificateFile({ mismatch: true }), password),
+      inspectCertificate(
+        containerFile([shroudedKeyBag(otherRsaKey), certificateBag()]),
+        password,
+      ),
     ).toThrow("must match exactly one certificate");
   });
 
   it("rejects containers with multiple private keys", () => {
     expect(() =>
-      inspectCertificate(certificateFile({ duplicateKey: true }), password),
+      inspectCertificate(
+        containerFile([
+          shroudedKeyBag(rsaKey),
+          shroudedKeyBag(rsaKey),
+          certificateBag(),
+        ]),
+        password,
+      ),
     ).toThrow("exactly one private key");
+  });
+
+  it("rejects unencrypted private keys and non-RSA keys", () => {
+    expect(() =>
+      inspectCertificate(
+        containerFile([plainKeyBag(rsaKey), certificateBag()]),
+        password,
+      ),
+    ).toThrow("password-protected");
+    expect(() =>
+      inspectCertificate(certificateFile({ key: keyFile("ec") }), password),
+    ).toThrow("Only RSA");
+  });
+
+  it.each([
+    ["AES-256 with a SHA-256 MAC (OpenSSL 3 default)", []],
+    ["legacy RC2-40 certificates and 3DES keys", ["-legacy"]],
+    [
+      "3DES certificates and keys with a SHA-1 MAC",
+      [
+        "-certpbe",
+        "PBE-SHA1-3DES",
+        "-keypbe",
+        "PBE-SHA1-3DES",
+        "-macalg",
+        "sha1",
+      ],
+    ],
+    ["unencrypted certificates", ["-certpbe", "NONE"]],
+  ])("signs with a PKCS#12 file using %s", async (_name, args) => {
+    // A non-ASCII password exercises both the BMPString and UTF-8 encodings.
+    const unicodePassword = "contraseña-ñ-€";
+    const certificate = certificateFile({ password: unicodePassword, args });
+    expect(inspectCertificate(certificate, unicodePassword).subject).toBe(
+      "CN=Disposable test certificate",
+    );
+    expect(() => inspectCertificate(certificate, password)).toThrow(
+      "Check the password",
+    );
+    const verification = verifyWithOpenSsl(
+      await signPdf(pdf, certificate, unicodePassword),
+    );
+    expect(verification.valid, verification.error).toBe(true);
+  });
+
+  it("rejects excessive key-derivation iteration counts", () => {
+    expect(() =>
+      inspectCertificate(
+        certificateFile({ args: ["-iter", "1000001"] }),
+        password,
+      ),
+    ).toThrow("Cannot open");
   });
 
   it("rejects malformed inputs and oversized inputs", async () => {

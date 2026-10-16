@@ -13,6 +13,7 @@ See the [development roadmap](docs/ROADMAP.md) for prioritized issues, acceptanc
 - Clear certificate data after a successful save, session reset, or window close.
 
 PDFs are limited to 25 MiB; certificate files to 2 MiB. The certificate needs one matching RSA private key in a protected PKCS#12 key bag.
+Supported PKCS#12 encryption: PBES2 with AES or 3DES, and legacy SHA-1 3DES or RC2.
 
 ## Development
 
@@ -31,7 +32,7 @@ bun run lint
 bun run test
 ```
 
-Tests require OpenSSL with the `cms` command. They generate disposable certificates and verify signed bytes independently.
+Tests require OpenSSL 3.4 or later with the `cms` command and the legacy provider. They generate disposable certificates and verify signed bytes independently.
 OpenSSL is a test dependency; the application does not invoke it.
 
 `bun run build` compiles the application. `bun run start` opens that compiled output.
