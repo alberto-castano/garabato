@@ -508,6 +508,10 @@ describe("local PDF signing", () => {
     await expect(inspectPdf(Buffer.from("not a pdf"))).rejects.toThrow(
       "valid, unencrypted PDF",
     );
+    // pdf-lib loads this, but it has no catalog or page tree.
+    await expect(inspectPdf(Buffer.from("%PDF-1.7\n%%EOF\n"))).rejects.toThrow(
+      "valid, unencrypted PDF",
+    );
     await expect(inspectPdf(Buffer.alloc(MAX_PDF_BYTES + 1))).rejects.toThrow(
       "25 MiB",
     );
