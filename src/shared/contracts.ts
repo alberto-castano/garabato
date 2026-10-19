@@ -38,6 +38,11 @@ export interface CertificateInfo {
   fingerprint: string;
 }
 
+/** A Keychain identity. id is an opaque reference valid for this session. */
+export interface KeychainIdentity extends CertificateInfo {
+  id: string;
+}
+
 export interface SignedFile {
   name: string;
   bytes: number;
@@ -47,6 +52,8 @@ export interface GarabatoApi {
   choosePdf(): Promise<Result<OpenedDocument | null>>;
   chooseCertificate(): Promise<Result<{ name: string } | null>>;
   unlockCertificate(password: string): Promise<Result<CertificateInfo>>;
+  listKeychainIdentities(): Promise<Result<KeychainIdentity[]>>;
+  selectKeychainIdentity(id: string): Promise<Result<CertificateInfo>>;
   /** An unsigned copy with the signature box drawn, for the final preview. */
   previewSignature(placement: Placement): Promise<Result<Uint8Array>>;
   /** Without a placement, the signature has no visible box. */

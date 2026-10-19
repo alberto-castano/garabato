@@ -59,6 +59,35 @@ function api(): GarabatoApi {
         validTo: "2030-01-01",
       },
     })),
+    listKeychainIdentities: vi.fn<GarabatoApi["listKeychainIdentities"]>(
+      async () => ({
+        ok: true,
+        value: [
+          {
+            id: "opaque-1",
+            subject: "Keychain signer",
+            signer: "Keychain signer",
+            issuer: "Keychain issuer",
+            fingerprint: "def456",
+            validFrom: "2026-01-01",
+            validTo: "2030-01-01",
+          },
+        ],
+      }),
+    ),
+    selectKeychainIdentity: vi.fn<GarabatoApi["selectKeychainIdentity"]>(
+      async () => ({
+        ok: true,
+        value: {
+          subject: "Keychain signer",
+          signer: "Keychain signer",
+          issuer: "Keychain issuer",
+          fingerprint: "def456",
+          validFrom: "2026-01-01",
+          validTo: "2030-01-01",
+        },
+      }),
+    ),
     previewSignature: vi.fn<GarabatoApi["previewSignature"]>(async () => ({
       ok: true,
       value: new Uint8Array([37, 80, 68, 70]),
@@ -286,5 +315,78 @@ it("does not pretend to sign when opened outside Electron", () => {
   expect(
     screen.getByRole<HTMLButtonElement>("button", { name: "Choose PDF" })
       .disabled,
+  ).toBe(true);
+});
+
+it("signs with a Keychain identity chosen by its opaque reference", async () => {
+  const bridge = api();
+  const user = userEvent.setup();
+  render(<App api={bridge} />);
+  await user.click(screen.getByRole("button", { name: "Choose PDF" }));
+  await user.click(screen.getByRole("button", { name: "Find in Keychain" }));
+  const list = screen.getByRole("list", { name: "Keychain certificates" });
+  expect(list.textContent).toContain("Keychain issuer");
+  await user.click(screen.getByRole("button", { name: /Keychain signer/ }));
+  expect(bridge.selectKeychainIdentity).toHaveBeenCalledWith("opaque-1");
+  expect(screen.getByText("Keychain certificate selected")).toBeTruthy();
+  expect(screen.queryByLabelText("Certificate password")).toBeNull();
+  await user.click(screen.getByRole("button", { name: "Review and sign" }));
+  expect(await screen.findByText("No visible box")).toBeTruthy();
+  await user.click(screen.getByRole("button", { name: "Sign and save copy" }));
+  expect(await screen.findByText("Signed copy saved")).toBeTruthy();
+});
+
+it("shows Keychain denial and cancellation without enabling signing", async () => {
+  const bridge = api();
+  const user = userEvent.setup();
+  render(<App api={bridge} />);
+  await user.click(screen.getByRole("button", { name: "Choose PDF" }));
+  await user.click(screen.getByRole("button", { name: "Find in Keychain" }));
+  await user.click(screen.getByRole("button", { name: /Keychain signer/ }));
+  bridge.signAndSave = vi.fn<GarabatoApi["signAndSave"]>(async () => ({
+    ok: false,
+    error: "Signing was canceled.",
+  }));
+  await user.click(screen.getByRole("button", { name: "Review and sign" }));
+  await user.click(screen.getByRole("button", { name: "Sign and save copy" }));
+  expect(await screen.findByText("Signing was canceled.")).toBeTruthy();
+  // The review stays, so the user can try again after a cancellation.
+  expect(screen.queryByText("Signed copy saved")).toBeNull();
+  await user.click(screen.getByRole("button", { name: "Back" }));
+  expect(screen.getByText("Keychain certificate selected")).toBeTruthy();
+});
+
+it("says when the Keychain has no eligible certificates", async () => {
+  const bridge = api();
+  bridge.listKeychainIdentities = vi.fn<GarabatoApi["listKeychainIdentities"]>(
+    async () => ({ ok: true, value: [] }),
+  );
+  render(<App api={bridge} />);
+  fireEvent.click(screen.getByRole("button", { name: "Find in Keychain" }));
+  expect(
+    await screen.findByText(/No valid RSA signing certificates/),
+  ).toBeTruthy();
+  expect(
+    screen.getByRole<HTMLButtonElement>("button", {
+      name: "Review and sign",
+    }).disabled,
+  ).toBe(true);
+});
+
+it("does not keep an unlocked file certificate hidden behind the Keychain list", async () => {
+  const bridge = api();
+  const user = userEvent.setup();
+  render(<App api={bridge} />);
+  await user.click(screen.getByRole("button", { name: "Choose PDF" }));
+  await user.click(screen.getByRole("button", { name: "Choose certificate" }));
+  await user.click(screen.getByRole("button", { name: "Unlock certificate" }));
+  expect(screen.getByText("CN=Test signer, C=ES")).toBeTruthy();
+  await user.click(screen.getByRole("button", { name: "Find in Keychain" }));
+  expect(screen.queryByText("CN=Test signer, C=ES")).toBeNull();
+  expect(screen.queryByText("Test.p12")).toBeNull();
+  expect(
+    screen.getByRole<HTMLButtonElement>("button", {
+      name: "Review and sign",
+    }).disabled,
   ).toBe(true);
 });

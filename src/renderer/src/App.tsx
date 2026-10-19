@@ -5,6 +5,7 @@ import {
   FileTextIcon,
   FolderOpenIcon,
   KeyRoundIcon,
+  KeySquareIcon,
   LockKeyholeIcon,
   PenLineIcon,
   ShieldCheckIcon,
@@ -44,6 +45,7 @@ import type {
   CertificateInfo,
   DocumentInfo,
   GarabatoApi,
+  KeychainIdentity,
   Placement,
   Result,
   SignedFile,
@@ -64,6 +66,10 @@ export function App({ api = window.garabato }: { api?: GarabatoApi }) {
   const [document, setDocument] = useState<DocumentInfo | null>(null);
   const [certificateFile, setCertificateFile] = useState<string | null>(null);
   const [certificate, setCertificate] = useState<CertificateInfo | null>(null);
+  const [keychainIdentities, setKeychainIdentities] = useState<
+    KeychainIdentity[] | null
+  >(null);
+  const [fromKeychain, setFromKeychain] = useState(false);
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [working, setWorking] = useState<string | null>(null);
@@ -134,9 +140,35 @@ export function App({ api = window.garabato }: { api?: GarabatoApi }) {
       if (chosen) {
         setCertificateFile(chosen.name);
         setCertificate(null);
+        setKeychainIdentities(null);
+        setFromKeychain(false);
         setPassword("");
         setSaved(null);
       }
+    });
+  }
+
+  function findKeychainIdentities() {
+    if (!api) return;
+    void run("Reading Keychain…", async () => {
+      setKeychainIdentities(unwrap(await api.listKeychainIdentities()));
+      // The main process cleared the previous certificate.
+      setCertificate(null);
+      setCertificateFile(null);
+      setFromKeychain(false);
+      setPassword("");
+      setSaved(null);
+    });
+  }
+
+  function selectKeychainIdentity(id: string) {
+    if (!api) return;
+    void run("Selecting certificate…", async () => {
+      setCertificate(unwrap(await api.selectKeychainIdentity(id)));
+      setFromKeychain(true);
+      setCertificateFile(null);
+      setKeychainIdentities(null);
+      setPassword("");
     });
   }
 
@@ -166,16 +198,23 @@ export function App({ api = window.garabato }: { api?: GarabatoApi }) {
 
   function sign() {
     if (!api) return;
-    void run("Signing and saving…", async () => {
-      const result = unwrap(await api.signAndSave(placement));
-      if (result) {
-        setReview(null);
-        setSaved(result);
-        setCertificate(null);
-        setCertificateFile(null);
-        setPassword("");
-      }
-    });
+    void run(
+      fromKeychain
+        ? "Signing and saving… macOS may ask you to allow access to the key."
+        : "Signing and saving…",
+      async () => {
+        const result = unwrap(await api.signAndSave(placement));
+        if (result) {
+          setReview(null);
+          setSaved(result);
+          setCertificate(null);
+          setCertificateFile(null);
+          setKeychainIdentities(null);
+          setFromKeychain(false);
+          setPassword("");
+        }
+      },
+    );
   }
 
   function reset() {
@@ -188,6 +227,8 @@ export function App({ api = window.garabato }: { api?: GarabatoApi }) {
       setDocument(null);
       setCertificate(null);
       setCertificateFile(null);
+      setKeychainIdentities(null);
+      setFromKeychain(false);
       setPassword("");
       setSaved(null);
     });
@@ -221,7 +262,13 @@ export function App({ api = window.garabato }: { api?: GarabatoApi }) {
           </div>
           <Button
             variant="ghost"
-            disabled={disabled || (!document && !certificateFile)}
+            disabled={
+              disabled ||
+              (!document &&
+                !certificateFile &&
+                !certificate &&
+                !keychainIdentities)
+            }
             onClick={reset}
           >
             Clear session
@@ -372,30 +419,74 @@ export function App({ api = window.garabato }: { api?: GarabatoApi }) {
                   <h2>02 / Your certificate</h2>
                 </CardTitle>
                 <CardDescription>
-                  Use an RSA certificate in a .p12 or .pfx file.
+                  Use an RSA certificate in a .p12 or .pfx file or in your macOS
+                  Keychain.
                 </CardDescription>
               </CardHeader>
               <CardContent className="flex flex-col gap-5">
-                <Button
-                  variant="outline"
-                  onClick={chooseCertificate}
-                  disabled={disabled}
-                >
-                  <KeyRoundIcon data-icon="inline-start" />
-                  {certificateFile
-                    ? "Change certificate"
-                    : "Choose certificate"}
-                </Button>
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <Button
+                    variant="outline"
+                    onClick={chooseCertificate}
+                    disabled={disabled}
+                  >
+                    <KeyRoundIcon data-icon="inline-start" />
+                    {certificateFile
+                      ? "Change certificate"
+                      : "Choose certificate"}
+                  </Button>
+                  <Button
+                    variant="outline"
+                    onClick={findKeychainIdentities}
+                    disabled={disabled}
+                  >
+                    <KeySquareIcon data-icon="inline-start" />
+                    Find in Keychain
+                  </Button>
+                </div>
                 {certificateFile && (
                   <p className="break-all text-sm text-muted-foreground">
                     {certificateFile}
                   </p>
                 )}
-                {certificate ? (
+                {keychainIdentities ? (
+                  keychainIdentities.length > 0 ? (
+                    <ul
+                      aria-label="Keychain certificates"
+                      className="flex flex-col gap-2"
+                    >
+                      {keychainIdentities.map((identity) => (
+                        <li key={identity.id}>
+                          <Button
+                            variant="ghost"
+                            className="h-auto w-full flex-col items-start gap-1 whitespace-normal border px-3 py-2 text-left"
+                            onClick={() => selectKeychainIdentity(identity.id)}
+                            disabled={disabled}
+                          >
+                            <span className="break-words font-medium">
+                              {identity.subject}
+                            </span>
+                            <span className="break-words text-xs text-muted-foreground">
+                              {identity.issuer} · Expires{" "}
+                              {new Date(identity.validTo).toLocaleDateString()}
+                            </span>
+                          </Button>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : (
+                    <p className="text-sm leading-relaxed text-muted-foreground">
+                      No valid RSA signing certificates were found in your
+                      Keychain.
+                    </p>
+                  )
+                ) : certificate ? (
                   <div className="flex flex-col gap-4">
                     <Badge variant="secondary">
-                      <CheckIcon data-icon="inline-start" /> Certificate
-                      unlocked
+                      <CheckIcon data-icon="inline-start" />{" "}
+                      {fromKeychain
+                        ? "Keychain certificate selected"
+                        : "Certificate unlocked"}
                     </Badge>
                     <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-3 text-sm">
                       <dt className="text-muted-foreground">Signed by</dt>
@@ -454,13 +545,14 @@ export function App({ api = window.garabato }: { api?: GarabatoApi }) {
                   <p className="text-sm leading-relaxed text-muted-foreground">
                     Your certificate identifies you and contains the private key
                     used to sign. You’ll review its details before signing.
+                    Keychain keys stay in the Keychain; macOS asks before
+                    Garabato uses one.
                   </p>
                 )}
               </CardContent>
               <CardFooter>
                 <p className="text-sm text-muted-foreground">
-                  File certificates only for now. Keychain, DNIe, and hardware
-                  tokens come later.
+                  DNIe, smart cards, and hardware tokens come later.
                 </p>
               </CardFooter>
             </Card>
@@ -502,7 +594,7 @@ export function App({ api = window.garabato }: { api?: GarabatoApi }) {
                 ? "Check the final preview, then sign."
                 : document && certificate
                   ? "Ready. Confirm the document and certificate, then sign."
-                  : "Choose a document and unlock a certificate to continue.")}
+                  : "Choose a document and a certificate to continue.")}
         </p>
       </main>
       <footer className="flex flex-col gap-5 pb-6">

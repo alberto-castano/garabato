@@ -1,4 +1,4 @@
-import { createHash, type KeyObject, sign } from "node:crypto";
+import { createHash } from "node:crypto";
 import * as asn1js from "asn1js";
 import * as pkijs from "pkijs";
 
@@ -26,14 +26,15 @@ function attribute(type: string, value: asn1js.AsnType): pkijs.Attribute {
 /**
  * Creates a detached CMS SignedData (RFC 5652) for adbe.pkcs7.detached with
  * SHA-256 and RSA PKCS#1 v1.5. Certificates are DER and embedded unchanged.
+ * sign returns the RSA PKCS#1 v1.5 SHA-256 signature of its input.
  */
-export function signDetached(options: {
+export async function signDetached(options: {
   content: Buffer;
   signer: Buffer;
   certificates: Buffer[];
-  key: KeyObject;
+  sign: (data: Buffer) => Promise<Buffer>;
   signingTime: Date;
-}): Buffer {
+}): Promise<Buffer> {
   const signer = pkijs.Certificate.fromBER(new Uint8Array(options.signer));
   // EU validators expect this attribute order.
   const signedAttrs = new pkijs.SignedAndUnsignedAttributes({
@@ -69,7 +70,7 @@ export function signDetached(options: {
     signedAttrs,
     signatureAlgorithm: algorithm(oids.rsaEncryption),
     signature: new asn1js.OctetString({
-      valueHex: sign("sha256", signedBytes, options.key),
+      valueHex: await options.sign(signedBytes),
     }),
   });
   const signedData = new pkijs.SignedData({

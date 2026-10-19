@@ -16,3 +16,5 @@ coverage/
 .env
 .env.*
 !.env.example
+# Compiled Keychain helper.
+native/build/

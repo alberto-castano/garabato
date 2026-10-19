@@ -74,6 +74,9 @@ Garabato writes a complete new file, not an incremental update. Repaired inputs 
 | Visible box on any page, including rotated and cropped pages | Supported; at least 72 × 24 points |
 | Signer name characters outside Windows Latin-1 in the visible box | Shown as `?`; the certificate is unchanged |
 | EC keys, unencrypted keys, several keys | Rejected |
+| macOS Keychain identity with an RSA key and a valid certificate | Supported; macOS asks before each use it has not allowed |
+| Keychain identity with an EC key | Not listed |
+| Smart-card and token identities | Not tested ([#17](https://github.com/alberto-castano/garabato/issues/17)) |
 
 ## Manual checks
 
