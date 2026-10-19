@@ -2,6 +2,7 @@ import {
   createHash,
   createPrivateKey,
   type KeyObject,
+  sign,
   X509Certificate,
 } from "node:crypto";
 import {
@@ -27,6 +28,22 @@ export const MAX_P12_BYTES = 2 * 1024 * 1024;
 const SIGNATURE_HEX_LENGTH = 32768;
 
 export type { CertificateInfo } from "../shared/contracts";
+
+/** A signing identity. The private key stays with its provider. */
+export interface CertificateProvider {
+  readonly info: CertificateInfo;
+  /** Signer certificate, DER. */
+  readonly signer: Buffer;
+  /** Certificates to embed in the signature, DER. */
+  readonly certificates: Buffer[];
+  /** Returns the RSA PKCS#1 v1.5 SHA-256 signature of data. */
+  sign(data: Buffer): Promise<Buffer>;
+  /** Discards secret data that the provider holds. */
+  clear(): void;
+}
+
+/** A provider failure with a message that is safe to show as is. */
+export class CertificateError extends Error {}
 
 function checkSize(bytes: Buffer, limit: number, label: string): void {
   if (bytes.length === 0 || bytes.length > limit) {
@@ -118,6 +135,32 @@ function certificateName(name: pkijs.RelativeDistinguishedNames): string {
     .join(", ");
 }
 
+/**
+ * Returns display metadata for a signer certificate.
+ * Rejects certificates outside their validity dates.
+ */
+export function describeCertificate(der: Buffer): CertificateInfo {
+  let certificate: pkijs.Certificate;
+  try {
+    certificate = pkijs.Certificate.fromBER(new Uint8Array(der));
+  } catch {
+    throw new Error("Cannot read the signer certificate.");
+  }
+  const notBefore = certificate.notBefore.value;
+  const notAfter = certificate.notAfter.value;
+  const now = Date.now();
+  if (now < notBefore.getTime())
+    throw new Error("The certificate is not valid yet.");
+  if (now > notAfter.getTime()) throw new Error("The certificate has expired.");
+  return {
+    subject: certificateName(certificate.subject),
+    issuer: certificateName(certificate.issuer),
+    validFrom: notBefore.toISOString(),
+    validTo: notAfter.toISOString(),
+    fingerprint: createHash("sha256").update(der).digest("hex"),
+  };
+}
+
 function readCertificate(
   p12: Buffer,
   password: string,
@@ -165,26 +208,8 @@ function readCertificate(
   if (matching.length !== 1)
     throw new Error("The private key must match exactly one certificate.");
   const signer = matching[0].raw;
-  let certificate: pkijs.Certificate;
-  try {
-    certificate = pkijs.Certificate.fromBER(new Uint8Array(signer));
-  } catch {
-    throw unreadable;
-  }
-  const notBefore = certificate.notBefore.value;
-  const notAfter = certificate.notAfter.value;
-  const now = Date.now();
-  if (now < notBefore.getTime())
-    throw new Error("The certificate is not valid yet.");
-  if (now > notAfter.getTime()) throw new Error("The certificate has expired.");
   return {
-    info: {
-      subject: certificateName(certificate.subject),
-      issuer: certificateName(certificate.issuer),
-      validFrom: notBefore.toISOString(),
-      validTo: notAfter.toISOString(),
-      fingerprint: createHash("sha256").update(signer).digest("hex"),
-    },
+    info: describeCertificate(signer),
     signer,
     // Embed the whole container chain, as Adobe and EU validators expect.
     certificates: container.certificates,
@@ -192,20 +217,30 @@ function readCertificate(
   };
 }
 
-export function inspectCertificate(
-  p12: Buffer,
-  password: string,
-): CertificateInfo {
-  return readCertificate(p12, password).info;
+/**
+ * Opens a PKCS#12 file as a certificate provider. The provider keeps the file
+ * and password, and decrypts the private key again for each signature.
+ * clear() zeroes the file bytes.
+ */
+export function openPkcs12(p12: Buffer, password: string): CertificateProvider {
+  const { info, signer, certificates } = readCertificate(p12, password);
+  return {
+    info,
+    signer,
+    certificates,
+    sign: async (data) =>
+      sign("sha256", data, readCertificate(p12, password).key),
+    clear: () => p12.fill(0),
+  };
 }
 
 export async function signPdf(
   pdf: Buffer,
-  p12: Buffer,
-  password: string,
+  provider: CertificateProvider,
 ): Promise<Buffer> {
   const document = await loadUnsignedPdf(pdf);
-  const certificate = readCertificate(p12, password);
+  // Check the dates again: time can pass between selection and signing.
+  describeCertificate(provider.signer);
   try {
     const fieldNames = new Set(
       document
@@ -306,8 +341,10 @@ export async function signPdf(
       bodyOffset + signatureBody.indexOf(byteRangePlaceholder),
       "ascii",
     );
-    const signature = signDetached({
-      ...certificate,
+    const signature = await signDetached({
+      signer: provider.signer,
+      certificates: provider.certificates,
+      sign: (data) => provider.sign(data),
       content: Buffer.concat([
         prepared.subarray(0, start),
         prepared.subarray(end),
@@ -319,7 +356,8 @@ export async function signPdf(
       throw new Error("Signature is too large");
     prepared.write(hex.padEnd(SIGNATURE_HEX_LENGTH, "0"), start + 1, "ascii");
     return prepared;
-  } catch {
+  } catch (error) {
+    if (error instanceof CertificateError) throw error;
     throw new Error(
       "Signing failed. This PDF or certificate is not supported.",
     );

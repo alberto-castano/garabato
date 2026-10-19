@@ -1,11 +1,24 @@
-import type { CertificateInfo, DocumentInfo } from "../shared/contracts";
-import { inspectCertificate, inspectPdf, signPdf } from "./signing";
+import { randomUUID } from "node:crypto";
+import type {
+  CertificateInfo,
+  DocumentInfo,
+  KeychainIdentity,
+} from "../shared/contracts";
+import {
+  type CertificateProvider,
+  inspectPdf,
+  openPkcs12,
+  signPdf,
+} from "./signing";
 
 export class SigningSession {
   generation = 0;
   private pdf?: Buffer;
+  /** A chosen certificate file that is not unlocked yet. */
   private p12?: Buffer;
-  private password?: string;
+  private provider?: CertificateProvider;
+  /** The last Keychain listing, by opaque reference. */
+  private keychain = new Map<string, CertificateProvider>();
   document?: DocumentInfo;
 
   assertActive(generation: number): void {
@@ -45,34 +58,60 @@ export class SigningSession {
   }
 
   unlock(password: unknown): CertificateInfo {
-    this.password = undefined;
+    // The file stays for another attempt; only the unlocked state is dropped.
+    this.provider = undefined;
     if (typeof password !== "string" || password.length > 1024) {
       throw new Error(
         "Enter a certificate password of at most 1,024 characters.",
       );
     }
     if (!this.p12) throw new Error("Choose a certificate file first.");
-    const certificate = inspectCertificate(this.p12, password);
-    this.password = password;
-    return certificate;
+    this.provider = openPkcs12(this.p12, password);
+    return this.provider.info;
+  }
+
+  /**
+   * Replaces the Keychain listing and returns opaque references to it.
+   * A new listing starts a new certificate choice, so the current one is cleared.
+   */
+  setKeychainIdentities(
+    providers: CertificateProvider[],
+    generation = this.generation,
+  ): KeychainIdentity[] {
+    this.assertActive(generation);
+    this.clearCertificate();
+    this.keychain = new Map(
+      providers.map((provider) => [randomUUID(), provider]),
+    );
+    return [...this.keychain].map(([id, { info }]) => ({ id, ...info }));
+  }
+
+  selectKeychainIdentity(id: unknown): CertificateInfo {
+    const provider = typeof id === "string" ? this.keychain.get(id) : undefined;
+    if (!provider) throw new Error("Find your Keychain certificates again.");
+    this.clearCertificate();
+    this.provider = provider;
+    return provider.info;
   }
 
   async sign(): Promise<Buffer> {
-    if (!this.pdf || !this.p12 || this.password === undefined) {
-      throw new Error("Choose a PDF and unlock your certificate first.");
+    if (!this.pdf || !this.provider) {
+      throw new Error("Choose a PDF and a certificate first.");
     }
-    return signPdf(this.pdf, this.p12, this.password);
+    return signPdf(this.pdf, this.provider);
   }
 
   clearCertificate(): void {
+    this.provider?.clear();
+    this.provider = undefined;
     this.p12?.fill(0);
     this.p12 = undefined;
-    this.password = undefined;
   }
 
   reset(): void {
     this.generation += 1;
     this.clearCertificate();
+    this.keychain.clear();
     this.pdf?.fill(0);
     this.pdf = undefined;
     this.document = undefined;

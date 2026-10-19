@@ -15,10 +15,10 @@ import * as asn1js from "asn1js";
 import * as pkijs from "pkijs";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
-  inspectCertificate,
   inspectPdf,
   MAX_P12_BYTES,
   MAX_PDF_BYTES,
+  openPkcs12,
   signPdf,
 } from "../src/main/signing";
 
@@ -245,12 +245,12 @@ describe("local PDF signing", () => {
     document.addPage().drawText("Disposable signing fixture");
     pdf = Buffer.from(await document.save());
     p12 = certificateFile();
-    signed = await signPdf(pdf, p12, password);
+    signed = await signPdf(pdf, openPkcs12(p12, password));
   });
 
   it("inspects a PDF and the matching RSA certificate", async () => {
     expect(await inspectPdf(pdf)).toEqual({ pageCount: 1 });
-    expect(inspectCertificate(p12, password)).toMatchObject({
+    expect(openPkcs12(p12, password).info).toMatchObject({
       subject: "CN=Disposable test certificate",
       issuer: "CN=Disposable test certificate",
       fingerprint: expect.stringMatching(/^[a-f0-9]{64}$/),
@@ -285,8 +285,7 @@ describe("local PDF signing", () => {
     );
     const result = await signPdf(
       Buffer.from(await document.save()),
-      p12,
-      password,
+      openPkcs12(p12, password),
     );
     const output = await PDFDocument.load(result, {
       throwOnInvalidObject: true,
@@ -300,10 +299,10 @@ describe("local PDF signing", () => {
 
   it("keeps PDF syntax valid for Unicode, parentheses, and backslashes in certificate subjects", async () => {
     const certificate = certificateFile({ subject: "/CN=María (Equipo\\\\" });
-    expect(inspectCertificate(certificate, password).subject).toBe(
+    expect(openPkcs12(certificate, password).info.subject).toBe(
       "CN=María (Equipo\\",
     );
-    const result = await signPdf(pdf, certificate, password);
+    const result = await signPdf(pdf, openPkcs12(certificate, password));
     const output = await PDFDocument.load(result, {
       throwOnInvalidObject: true,
     });
@@ -327,8 +326,7 @@ describe("local PDF signing", () => {
     }
     const result = await signPdf(
       Buffer.from(await document.save()),
-      p12,
-      password,
+      openPkcs12(p12, password),
     );
     const output = await PDFDocument.load(result);
     const form = output.getForm();
@@ -345,10 +343,8 @@ describe("local PDF signing", () => {
 
   it("preserves a multi-valued Unicode issuer RDN in the CMS signer identifier", async () => {
     const certificate = certificateFile({ subject: "/CN=Issuér+OU=Signing" });
-    expect(inspectCertificate(certificate, password).issuer).toContain(
-      "Issuér",
-    );
-    const result = await signPdf(pdf, certificate, password);
+    expect(openPkcs12(certificate, password).info.issuer).toContain("Issuér");
+    const result = await signPdf(pdf, openPkcs12(certificate, password));
     const verification = verifyWithOpenSsl(result);
     expect(verification.valid, verification.error).toBe(true);
   });
@@ -357,7 +353,7 @@ describe("local PDF signing", () => {
     await expect(inspectPdf(signed)).rejects.toThrow(
       "already contains a signature",
     );
-    await expect(signPdf(signed, p12, password)).rejects.toThrow(
+    await expect(signPdf(signed, openPkcs12(p12, password))).rejects.toThrow(
       "already contains a signature",
     );
   });
@@ -376,7 +372,7 @@ describe("local PDF signing", () => {
     await expect(inspectPdf(input)).rejects.toThrow(
       "XFA forms are not supported",
     );
-    await expect(signPdf(input, p12, password)).rejects.toThrow(
+    await expect(signPdf(input, openPkcs12(p12, password))).rejects.toThrow(
       "XFA forms are not supported",
     );
   });
@@ -391,7 +387,7 @@ describe("local PDF signing", () => {
       document.context.register(PDFString.of(note)),
     );
     const input = Buffer.from(await document.save({ useObjectStreams: false }));
-    const result = await signPdf(input, p12, password);
+    const result = await signPdf(input, openPkcs12(p12, password));
     const output = await PDFDocument.load(result, {
       throwOnInvalidObject: true,
     });
@@ -404,23 +400,19 @@ describe("local PDF signing", () => {
   });
 
   it("rejects wrong passwords without including the supplied password", async () => {
-    expect(() => inspectCertificate(p12, "wrong-secret")).toThrow(
-      "Check the password",
-    );
-    await expect(signPdf(pdf, p12, "wrong-secret")).rejects.not.toThrow(
-      "wrong-secret",
-    );
+    expect(() => openPkcs12(p12, "wrong-secret")).toThrow("Check the password");
+    expect(() => openPkcs12(p12, "wrong-secret")).not.toThrow("wrong-secret");
   });
 
   it("rejects expired and not-yet-valid certificates", () => {
     expect(() =>
-      inspectCertificate(
+      openPkcs12(
         certificateFile({ to: new Date(Date.now() - 1000) }),
         password,
       ),
     ).toThrow("expired");
     expect(() =>
-      inspectCertificate(
+      openPkcs12(
         certificateFile({ from: new Date(Date.now() + 60_000) }),
         password,
       ),
@@ -429,10 +421,10 @@ describe("local PDF signing", () => {
 
   it("rejects missing keys and certificates that do not match the private key", () => {
     expect(() =>
-      inspectCertificate(containerFile([certificateBag()]), password),
+      openPkcs12(containerFile([certificateBag()]), password),
     ).toThrow("exactly one private key");
     expect(() =>
-      inspectCertificate(
+      openPkcs12(
         containerFile([shroudedKeyBag(otherRsaKey), certificateBag()]),
         password,
       ),
@@ -441,7 +433,7 @@ describe("local PDF signing", () => {
 
   it("rejects containers with multiple private keys", () => {
     expect(() =>
-      inspectCertificate(
+      openPkcs12(
         containerFile([
           shroudedKeyBag(rsaKey),
           shroudedKeyBag(rsaKey),
@@ -454,13 +446,13 @@ describe("local PDF signing", () => {
 
   it("rejects unencrypted private keys and non-RSA keys", () => {
     expect(() =>
-      inspectCertificate(
+      openPkcs12(
         containerFile([plainKeyBag(rsaKey), certificateBag()]),
         password,
       ),
     ).toThrow("password-protected");
     expect(() =>
-      inspectCertificate(certificateFile({ key: keyFile("ec") }), password),
+      openPkcs12(certificateFile({ key: keyFile("ec") }), password),
     ).toThrow("Only RSA");
   });
 
@@ -483,24 +475,21 @@ describe("local PDF signing", () => {
     // A non-ASCII password exercises both the BMPString and UTF-8 encodings.
     const unicodePassword = "contraseña-ñ-€";
     const certificate = certificateFile({ password: unicodePassword, args });
-    expect(inspectCertificate(certificate, unicodePassword).subject).toBe(
+    expect(openPkcs12(certificate, unicodePassword).info.subject).toBe(
       "CN=Disposable test certificate",
     );
-    expect(() => inspectCertificate(certificate, password)).toThrow(
+    expect(() => openPkcs12(certificate, password)).toThrow(
       "Check the password",
     );
     const verification = verifyWithOpenSsl(
-      await signPdf(pdf, certificate, unicodePassword),
+      await signPdf(pdf, openPkcs12(certificate, unicodePassword)),
     );
     expect(verification.valid, verification.error).toBe(true);
   });
 
   it("rejects excessive key-derivation iteration counts", () => {
     expect(() =>
-      inspectCertificate(
-        certificateFile({ args: ["-iter", "1000001"] }),
-        password,
-      ),
+      openPkcs12(certificateFile({ args: ["-iter", "1000001"] }), password),
     ).toThrow("Cannot open");
   });
 
@@ -515,12 +504,12 @@ describe("local PDF signing", () => {
     await expect(inspectPdf(Buffer.alloc(MAX_PDF_BYTES + 1))).rejects.toThrow(
       "25 MiB",
     );
-    expect(() =>
-      inspectCertificate(Buffer.from("not a p12"), password),
-    ).toThrow("Cannot open");
-    expect(() =>
-      inspectCertificate(Buffer.alloc(MAX_P12_BYTES + 1), password),
-    ).toThrow("2 MiB");
+    expect(() => openPkcs12(Buffer.from("not a p12"), password)).toThrow(
+      "Cannot open",
+    );
+    expect(() => openPkcs12(Buffer.alloc(MAX_P12_BYTES + 1), password)).toThrow(
+      "2 MiB",
+    );
   });
 
   it("rejects encrypted PDFs", async () => {

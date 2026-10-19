@@ -3,6 +3,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { app, BrowserWindow, dialog, ipcMain } from "electron";
 import type { Result } from "../shared/contracts";
 import { readBoundedFile, saveNewFile } from "./files";
+import { listKeychainIdentities } from "./keychain";
 import { SigningSession } from "./session";
 import { MAX_P12_BYTES, MAX_PDF_BYTES } from "./signing";
 
@@ -93,6 +94,22 @@ registerHandler("certificate:choose", async (_argument, generation) => {
 
 registerHandler("certificate:unlock", async (password) =>
   signing.unlock(password),
+);
+registerHandler("keychain:list", async (_argument, generation) => {
+  if (process.platform !== "darwin")
+    throw new Error("Keychain signing is available only on macOS.");
+  return signing.setKeychainIdentities(
+    await listKeychainIdentities({
+      // Packaging must copy the helper into the app resources (see README).
+      helper: app.isPackaged
+        ? join(process.resourcesPath, "garabato-keychain")
+        : join(app.getAppPath(), "native/build/garabato-keychain"),
+    }),
+    generation,
+  );
+});
+registerHandler("keychain:select", async (id) =>
+  signing.selectKeychainIdentity(id),
 );
 registerHandler("session:reset", async () => {
   signing.reset();

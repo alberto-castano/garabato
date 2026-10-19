@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PDFDocument } from "@cantoo/pdf-lib";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { inspectCertificate, inspectPdf, signPdf } from "../src/main/signing";
+import { inspectPdf, openPkcs12, signPdf } from "../src/main/signing";
 import { type FnmtIdentity, fnmtIdentity } from "./support/fnmt";
 
 // Independent validators. Versions are pinned here and recorded in
@@ -84,13 +84,13 @@ describe("independent PDF reader interoperability", () => {
   }, 60_000);
 
   it("validates an FNMT-like Unicode identity in pdfsig and pyHanko", async () => {
-    expect(inspectCertificate(identity.p12, password)).toMatchObject({
+    expect(openPkcs12(identity.p12, password).info).toMatchObject({
       subject:
         "C=ES, serialNumber=IDCES-99999999R, GN=MARÍA JOSÉ, SN=MUÑOZ GARCÍA-PELÁEZ, CN=MUÑOZ GARCÍA-PELÁEZ MARÍA JOSÉ - 99999999R",
       issuer: "C=ES, O=FNMT-RCM PRUEBAS, OU=Ceres, CN=AC FNMT Usuarios PRUEBAS",
     });
     const path = writePdf(
-      await signPdf(await simplePdf(), identity.p12, password),
+      await signPdf(await simplePdf(), openPkcs12(identity.p12, password)),
     );
 
     const withoutTrust = pdfsig(path, untrusted);
@@ -117,8 +117,7 @@ describe("independent PDF reader interoperability", () => {
     field.addToPage(document.addPage());
     const signed = await signPdf(
       Buffer.from(await document.save()),
-      identity.p12,
-      password,
+      openPkcs12(identity.p12, password),
     );
     const output = await PDFDocument.load(signed);
     expect(output.getForm().getTextField("Solicitante").getText()).toBe(
@@ -130,7 +129,10 @@ describe("independent PDF reader interoperability", () => {
   });
 
   it("reports changed signed bytes as invalid", async () => {
-    const signed = await signPdf(await simplePdf(), identity.p12, password);
+    const signed = await signPdf(
+      await simplePdf(),
+      openPkcs12(identity.p12, password),
+    );
     // The header comment is inside the first signed range.
     signed[7] = signed[7] === 55 ? 54 : 55;
     const path = writePdf(signed);
@@ -141,7 +143,10 @@ describe("independent PDF reader interoperability", () => {
   });
 
   it("reports page changes appended after signing", async () => {
-    const signed = await signPdf(await simplePdf(), identity.p12, password);
+    const signed = await signPdf(
+      await simplePdf(),
+      openPkcs12(identity.p12, password),
+    );
     const document = await PDFDocument.load(signed, {
       forIncrementalUpdate: true,
     });
@@ -168,7 +173,7 @@ describe("independent PDF reader interoperability", () => {
       },
     });
     const path = writePdf(
-      await signPdf(await simplePdf(), expiredCa.p12, password),
+      await signPdf(await simplePdf(), openPkcs12(expiredCa.p12, password)),
     );
     expect(pdfsig(path, untrusted)).toContain(
       "Signature Validation: Signature is Valid.",
@@ -177,9 +182,9 @@ describe("independent PDF reader interoperability", () => {
   }, 60_000);
 
   it("rejects a wrong password and invalid signer dates in a chained identity", () => {
-    expect(() =>
-      inspectCertificate(identity.p12, "contraseña-incorrecta"),
-    ).toThrow("Check the password");
+    expect(() => openPkcs12(identity.p12, "contraseña-incorrecta")).toThrow(
+      "Check the password",
+    );
     const day = 86_400_000;
     for (const [leaf, message] of [
       [
@@ -197,7 +202,7 @@ describe("independent PDF reader interoperability", () => {
         password,
         leaf,
       });
-      expect(() => inspectCertificate(dated.p12, password)).toThrow(message);
+      expect(() => openPkcs12(dated.p12, password)).toThrow(message);
     }
   }, 60_000);
 
@@ -218,7 +223,9 @@ describe("independent PDF reader interoperability", () => {
     ])("rejects %s", async (_name, damage) => {
       const input = Buffer.from(damage(pdf), "latin1");
       await expect(inspectPdf(input)).rejects.toThrow("valid, unencrypted PDF");
-      await expect(signPdf(input, identity.p12, password)).rejects.toThrow();
+      await expect(
+        signPdf(input, openPkcs12(identity.p12, password)),
+      ).rejects.toThrow();
     });
 
     // pdf-lib rebuilds these from their objects. The signed output is a new,
@@ -237,8 +244,7 @@ describe("independent PDF reader interoperability", () => {
     ])("repairs %s and produces a valid signature", async (_name, damage) => {
       const signed = await signPdf(
         Buffer.from(damage(pdf), "latin1"),
-        identity.p12,
-        password,
+        openPkcs12(identity.p12, password),
       );
       const path = writePdf(signed);
       const result = pdfsig(path, trusted);
