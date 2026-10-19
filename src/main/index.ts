@@ -4,7 +4,7 @@ import { app, BrowserWindow, dialog, ipcMain } from "electron";
 import type { Result } from "../shared/contracts";
 import { readBoundedFile, saveNewFile } from "./files";
 import { SigningSession } from "./session";
-import { MAX_P12_BYTES, MAX_PDF_BYTES } from "./signing";
+import { MAX_P12_BYTES, MAX_PDF_BYTES, parsePlacement } from "./signing";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const rendererFile = join(here, "../renderer/index.html");
@@ -73,7 +73,9 @@ registerHandler("document:choose", async (_argument, generation) => {
   } catch {
     throw new Error("Could not read this PDF. Choose a file under 25 MiB.");
   }
-  return signing.setDocument(basename(path), bytes, generation);
+  const document = await signing.setDocument(basename(path), bytes, generation);
+  // The renderer gets its own copy for preview; the session keeps the original.
+  return { ...document, data: new Uint8Array(bytes) };
 });
 
 registerHandler("certificate:choose", async (_argument, generation) => {
@@ -98,8 +100,15 @@ registerHandler("session:reset", async () => {
   signing.reset();
   return null;
 });
-registerHandler("document:sign", async (_argument, generation) => {
+registerHandler("document:preview", async (placement, generation) => {
+  const bytes = await signing.preview(placement);
+  signing.assertActive(generation);
+  return new Uint8Array(bytes);
+});
+registerHandler("document:sign", async (placement, generation) => {
   if (!window || !signing.document) throw new Error("Choose a PDF first.");
+  // Reject a bad placement before the save dialog opens.
+  parsePlacement(placement);
   const result = await dialog.showSaveDialog(window, {
     title: "Save signed copy",
     defaultPath: `${signing.document.name.replace(/\.pdf$/i, "")}-signed.pdf`,
@@ -107,7 +116,7 @@ registerHandler("document:sign", async (_argument, generation) => {
   });
   if (result.canceled || !result.filePath) return null;
   signing.assertActive(generation);
-  const bytes = await signing.sign();
+  const bytes = await signing.sign(placement);
   signing.assertActive(generation);
   try {
     await saveNewFile(result.filePath, bytes);

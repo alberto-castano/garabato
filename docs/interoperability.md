@@ -46,6 +46,7 @@ Results recorded on 2026-10-16, macOS 26.4, OpenSSL 3.6.4:
 | One byte changed in the signed range | — | Digest Mismatch | INVALID |
 | Page content appended after signing | — | Signature is Valid; no "Total document signed" | INVALID |
 | Valid signer, expired intermediate CA | Signs | Signature is Valid | INVALID (no valid path) |
+| Visible box on a page rotated 90° or 270° (2026-10-19) | Signs; `pdftoppm` shows the box upright in the chosen place | Signature is Valid | VALID |
 | Missing cross-reference table | Repairs and signs | Signature is Valid | VALID |
 | Wrong `startxref` offset | Repairs and signs | Signature is Valid | VALID |
 | Bytes before the header or after `%%EOF` | Repairs and signs | Signature is Valid | VALID |
@@ -70,6 +71,8 @@ Garabato writes a complete new file, not an incremental update. Repaired inputs 
 | Password-protected RSA PKCS#12 with one key, up to 2 MiB | Supported |
 | Certificate chain in the PKCS#12 | Embedded in the signature; not validated |
 | Signer outside its validity dates | Rejected |
+| Visible box on any page, including rotated and cropped pages | Supported; at least 72 × 24 points |
+| Signer name characters outside Windows Latin-1 in the visible box | Shown as `?`; the certificate is unchanged |
 | EC keys, unencrypted keys, several keys | Rejected |
 
 ## Manual checks
