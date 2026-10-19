@@ -30,8 +30,12 @@ These pieces replace dependencies that were unmaintained, vulnerable, or patched
   pkijs alone opens only PBES2 files. Older Windows and OpenSSL exports use the legacy SHA-1 3DES and RC2 algorithms.
   The appendix B key derivation is tested against published Bouncy Castle vectors.
 - `src/main/rc2.ts`: RC2-CBC decryption (RFC 2268). Node's OpenSSL 3 default provider has no RC2. Tests use OpenSSL `enc` ciphertexts.
-- The signature placeholder in `src/main/signing.ts`: a `/Sig` dictionary with `adbe.pkcs7.detached`, an invisible widget, and AcroForm `SigFlags` 3.
+- The signature placeholder in `src/main/signing.ts`: a `/Sig` dictionary with `adbe.pkcs7.detached`, a widget, and AcroForm `SigFlags` 3.
   The dictionary is written as fixed bytes, so the byte range and signature slot are at known offsets.
+- The visible box in `src/main/signing.ts`: a widget appearance stream with the signer common name and signing time in Helvetica.
+  The box position is relative to the displayed page. Like pdf.js, the displayed area is the crop box clipped to the media box.
+  On a rotated page, the appearance `/Matrix` cancels the rotation, so readers show the text upright.
+  Without a box, the widget has an empty rectangle and appearance, as before.
 
 PKCS#12 support: password MACs with SHA-1 or SHA-2; PBES2 with PBKDF2 and AES-CBC or 3DES; SHA-1 PBE with 3DES, RC2-128, or RC2-40.
 Key derivation is limited to 1,000,000 iterations so that a hostile file cannot stall the main process.
@@ -57,6 +61,17 @@ and patches only that object's byte range and signature slot. All replacements k
 - KDF and RC2 known-answer vectors, and the iteration limit.
 
 On 2026-10-16, Poppler `pdfsig` also reported valid, whole-document signatures for AES and legacy containers. It is not part of the test suite.
+
+## Preview
+
+| Package | Version | License | Maintenance | Use |
+| --- | --- | --- | --- | --- |
+| `pdfjs-dist` | 6.4.299 (2026-10-03) | Apache-2.0 | [Mozilla PDF.js](https://github.com/mozilla/pdf.js), the Firefox PDF viewer | Renders pages in the renderer for preview and box placement |
+
+Checked on 2026-10-19. `bun audit` reports no vulnerabilities.
+pdf.js lists `@napi-rs/canvas` 1.0.11 (MIT) as an optional dependency for Node.js. The application does not load it.
+The renderer loads the bundled worker from the application files. WebAssembly decoders are off, because the CSP does not allow WebAssembly.
+CMaps and standard font data are not bundled. pdf.js uses system fonts for non-embedded fonts. Some CJK text can preview incorrectly; the signed file is not affected.
 
 ## Desktop and interface
 
