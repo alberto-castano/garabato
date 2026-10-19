@@ -5,19 +5,43 @@ import {
   X509Certificate,
 } from "node:crypto";
 import {
+  beginText,
+  clip,
+  endPath,
+  endText,
+  fill,
+  moveText,
   PDFArray,
   PDFDict,
   PDFDocument,
+  type PDFFont,
   PDFInvalidObject,
   PDFName,
   PDFNumber,
   type PDFObject,
+  type PDFPage,
+  type PDFRef,
   PDFStream,
   PDFString,
+  popGraphicsState,
+  pushGraphicsState,
+  rectangle,
+  StandardFonts,
+  setFillingGrayscaleColor,
+  setFontAndSize,
+  setLineWidth,
+  setStrokingGrayscaleColor,
+  showText,
+  stroke,
 } from "@cantoo/pdf-lib";
 import * as asn1js from "asn1js";
 import * as pkijs from "pkijs";
-import type { CertificateInfo } from "../shared/contracts";
+import {
+  type CertificateInfo,
+  MIN_BOX_HEIGHT,
+  MIN_BOX_WIDTH,
+  type Placement,
+} from "../shared/contracts";
 import { signDetached } from "./cms";
 import { type Pkcs12Contents, readPkcs12 } from "./pkcs12";
 
@@ -177,9 +201,15 @@ function readCertificate(
   if (now < notBefore.getTime())
     throw new Error("The certificate is not valid yet.");
   if (now > notAfter.getTime()) throw new Error("The certificate has expired.");
+  const subject = certificateName(certificate.subject);
+  const commonName = certificate.subject.typesAndValues
+    .map(({ type, value }) => (type === "2.5.4.3" ? value : undefined))
+    .filter((value) => value instanceof asn1js.BaseStringBlock)
+    .at(-1);
   return {
     info: {
-      subject: certificateName(certificate.subject),
+      subject,
+      signer: commonName?.getValue() ?? subject,
       issuer: certificateName(certificate.issuer),
       validFrom: notBefore.toISOString(),
       validTo: notAfter.toISOString(),
@@ -199,25 +229,301 @@ export function inspectCertificate(
   return readCertificate(p12, password).info;
 }
 
+function isFraction(value: unknown): value is number {
+  return typeof value === "number" && value >= 0 && value <= 1;
+}
+
+// Renderer fractions come from floating-point layout.
+const TOLERANCE = 1e-6;
+
+/** Checks the shape of a placement from the renderer. Null means no visible box. */
+export function parsePlacement(value: unknown): Placement | null {
+  if (value === null || value === undefined) return null;
+  const outside = new Error("The signature box must be inside the page.");
+  if (typeof value !== "object") throw outside;
+  const { page, x, y, width, height } = value as Record<string, unknown>;
+  if (
+    typeof page !== "number" ||
+    !Number.isSafeInteger(page) ||
+    page < 0 ||
+    !isFraction(x) ||
+    !isFraction(y) ||
+    !isFraction(width) ||
+    !isFraction(height) ||
+    x + width > 1 + TOLERANCE ||
+    y + height > 1 + TOLERANCE
+  ) {
+    throw outside;
+  }
+  return { page, x, y, width, height };
+}
+
+/** Appearance matrices that cancel each quarter turn of the page. */
+const uprightMatrix: Record<number, number[]> = {
+  0: [1, 0, 0, 1, 0, 0],
+  90: [0, 1, -1, 0, 0, 0],
+  180: [-1, 0, 0, -1, 0, 0],
+  270: [0, -1, 1, 0, 0, 0],
+};
+
+export interface BoxGeometry {
+  /** Widget rectangle in page space: [left, bottom, right, top]. */
+  rect: [number, number, number, number];
+  /** Box size as displayed, in points. */
+  width: number;
+  height: number;
+  /** Form matrix that keeps the appearance upright on the rotated page. */
+  matrix: number[];
+}
+
+/**
+ * Maps a placement on the displayed page to page space. Like pdf.js, the
+ * displayed area is the crop box clipped to the media box, and only quarter
+ * turns rotate the page.
+ */
+export function boxGeometry(
+  document: PDFDocument,
+  placement: Placement,
+): BoxGeometry {
+  if (placement.page >= document.getPageCount())
+    throw new Error("The signature box must be inside the page.");
+  const page = document.getPage(placement.page);
+  const edges = ({
+    x,
+    y,
+    width,
+    height,
+  }: ReturnType<PDFPage["getCropBox"]>) => ({
+    left: Math.min(x, x + width),
+    bottom: Math.min(y, y + height),
+    right: Math.max(x, x + width),
+    top: Math.max(y, y + height),
+  });
+  const media = edges(page.getMediaBox());
+  const crop = edges(page.getCropBox());
+  let view = {
+    left: Math.max(media.left, crop.left),
+    bottom: Math.max(media.bottom, crop.bottom),
+    right: Math.min(media.right, crop.right),
+    top: Math.min(media.top, crop.top),
+  };
+  if (view.right <= view.left || view.top <= view.bottom) view = media;
+  const angle = page.getRotation().angle;
+  const rotation = angle % 90 === 0 ? ((angle % 360) + 360) % 360 : 0;
+  const pageWidth = view.right - view.left;
+  const pageHeight = view.top - view.bottom;
+  const [shownWidth, shownHeight] =
+    rotation % 180 === 0 ? [pageWidth, pageHeight] : [pageHeight, pageWidth];
+  const width = Math.min(placement.width, 1 - placement.x) * shownWidth;
+  const height = Math.min(placement.height, 1 - placement.y) * shownHeight;
+  if (
+    width < MIN_BOX_WIDTH - TOLERANCE ||
+    height < MIN_BOX_HEIGHT - TOLERANCE
+  ) {
+    throw new Error(
+      `The signature box must be at least ${MIN_BOX_WIDTH} by ${MIN_BOX_HEIGHT} points.`,
+    );
+  }
+  // (across, down) on the displayed page to page space.
+  const toPage = (across: number, down: number): [number, number] => {
+    switch (rotation) {
+      case 90:
+        return [view.left + down, view.bottom + across];
+      case 180:
+        return [view.right - across, view.bottom + down];
+      case 270:
+        return [view.right - down, view.top - across];
+      default:
+        return [view.left + across, view.top - down];
+    }
+  };
+  const left = placement.x * shownWidth;
+  const top = placement.y * shownHeight;
+  const [x1, y1] = toPage(left, top);
+  const [x2, y2] = toPage(left + width, top + height);
+  return {
+    rect: [
+      Math.min(x1, x2),
+      Math.min(y1, y2),
+      Math.max(x1, x2),
+      Math.max(y1, y2),
+    ],
+    width,
+    height,
+    matrix: uprightMatrix[rotation],
+  };
+}
+
+/** Text in the visible box. It names the signer; it does not claim validity. */
+export function boxText(signer: string, time: Date): string[] {
+  const minute = time.toISOString().slice(0, 16).replace("T", " ");
+  return ["Digitally signed by", signer, `Date: ${minute} UTC`];
+}
+
+function drawBox(
+  document: PDFDocument,
+  font: PDFFont,
+  box: BoxGeometry,
+  lines: string[],
+): PDFRef {
+  const { width, height } = box;
+  const supported = new Set(font.getCharacterSet());
+  // Helvetica covers Latin-1 names; other characters cannot be encoded.
+  const encodable = lines.map((line) =>
+    [...line]
+      .map((character) =>
+        supported.has(character.codePointAt(0) ?? 0) ? character : "?",
+      )
+      .join(""),
+  );
+  const bar = Math.min(6, Math.max(2, width * 0.03));
+  const padding = Math.min(6, height * 0.12);
+  const textLeft = bar + padding;
+  const widest = Math.max(
+    ...encodable.map((line) => font.widthOfTextAtSize(line, 1)),
+  );
+  const leading = 1.2;
+  const size = Math.min(
+    12,
+    (height - 2 * padding) / (encodable.length * leading),
+    (width - textLeft - padding) / widest,
+  );
+  const blockTop = (height + encodable.length * leading * size) / 2;
+  const operators = [
+    pushGraphicsState(),
+    rectangle(0, 0, width, height),
+    clip(),
+    endPath(),
+    // Opaque, so page content under the box does not hide the text.
+    setFillingGrayscaleColor(1),
+    rectangle(0, 0, width, height),
+    fill(),
+    setLineWidth(0.75),
+    setStrokingGrayscaleColor(0.55),
+    rectangle(0.375, 0.375, width - 0.75, height - 0.75),
+    stroke(),
+    setFillingGrayscaleColor(0.15),
+    // The bar marks the left edge, so readers show which way is up.
+    rectangle(0, 0, bar, height),
+    fill(),
+    beginText(),
+    setFontAndSize("F1", size),
+    moveText(textLeft, blockTop - size),
+    ...encodable.flatMap((line, index) => [
+      ...(index > 0 ? [moveText(0, -leading * size)] : []),
+      showText(font.encodeText(line)),
+    ]),
+    endText(),
+    popGraphicsState(),
+  ];
+  return document.context.register(
+    document.context.formXObject(operators, {
+      BBox: [0, 0, width, height],
+      Matrix: box.matrix,
+      Resources: { Font: { F1: font.ref } },
+    }),
+  );
+}
+
+interface WidgetOptions {
+  box: BoxGeometry | null;
+  pageIndex: number;
+  signer: string;
+  time: Date;
+  /** The signature dictionary. A preview has none. */
+  value?: PDFRef;
+}
+
+async function addSignatureWidget(
+  document: PDFDocument,
+  options: WidgetOptions,
+): Promise<void> {
+  const fieldNames = new Set(
+    document
+      .getForm()
+      .getFields()
+      // The new field is at the root, so also reserve existing group names.
+      .map((field) => field.getName().split(".")[0]),
+  );
+  let signatureName = "GarabatoSignature";
+  for (let suffix = 2; fieldNames.has(signatureName); suffix += 1) {
+    signatureName = `GarabatoSignature${suffix}`;
+  }
+  const { context } = document;
+  const { box } = options;
+  const page = document.getPage(options.pageIndex);
+  const appearance = box
+    ? drawBox(
+        document,
+        await document.embedFont(StandardFonts.Helvetica),
+        box,
+        boxText(options.signer, options.time),
+      )
+    : // An empty appearance stream, required for PDF/A.
+      context.register(
+        context.formXObject([], { BBox: [0, 0, 0, 0], Resources: {} }),
+      );
+  const widget = context.register(
+    context.obj({
+      Type: "Annot",
+      Subtype: "Widget",
+      FT: "Sig",
+      Rect: box?.rect ?? [0, 0, 0, 0],
+      ...(options.value ? { V: options.value } : {}),
+      T: PDFString.of(signatureName),
+      F: 4, // Print
+      P: page.ref,
+      AP: { N: appearance },
+    }),
+  );
+  // lookupMaybe() resolves indirect arrays, so existing trees stay in place.
+  const annotations = page.node.lookupMaybe(PDFName.of("Annots"), PDFArray);
+  if (annotations) annotations.push(widget);
+  else page.node.set(PDFName.of("Annots"), context.obj([widget]));
+  let form = document.catalog.lookupMaybe(PDFName.of("AcroForm"), PDFDict);
+  if (!form) {
+    form = context.obj({});
+    document.catalog.set(PDFName.of("AcroForm"), context.register(form));
+  }
+  const fields = form.lookupMaybe(PDFName.of("Fields"), PDFArray);
+  if (fields) fields.push(widget);
+  else form.set(PDFName.of("Fields"), context.obj([widget]));
+  // Add SignaturesExist (1) and AppendOnly (2) to any existing flags.
+  const flags = form.lookupMaybe(PDFName.of("SigFlags"), PDFNumber);
+  form.set(PDFName.of("SigFlags"), PDFNumber.of((flags?.asNumber() ?? 0) | 3));
+}
+
+/** An unsigned copy with the visible box, for the final preview. */
+export async function previewBox(
+  pdf: Buffer,
+  placement: Placement,
+  signer: string,
+): Promise<Buffer> {
+  const document = await loadUnsignedPdf(pdf);
+  const box = boxGeometry(document, placement);
+  try {
+    await addSignatureWidget(document, {
+      box,
+      pageIndex: placement.page,
+      signer,
+      time: new Date(),
+    });
+    return Buffer.from(await document.save({ useObjectStreams: false }));
+  } catch {
+    throw new Error("Cannot draw the signature box on this PDF.");
+  }
+}
+
 export async function signPdf(
   pdf: Buffer,
   p12: Buffer,
   password: string,
+  placement: Placement | null = null,
 ): Promise<Buffer> {
   const document = await loadUnsignedPdf(pdf);
+  const box = placement && boxGeometry(document, placement);
   const certificate = readCertificate(p12, password);
   try {
-    const fieldNames = new Set(
-      document
-        .getForm()
-        .getFields()
-        // The new field is at the root, so also reserve existing group names.
-        .map((field) => field.getName().split(".")[0]),
-    );
-    let signatureName = "GarabatoSignature";
-    for (let suffix = 2; fieldNames.has(signatureName); suffix += 1) {
-      signatureName = `GarabatoSignature${suffix}`;
-    }
     const signingTime = new Date();
     // Fixed-width placeholders: filling them keeps the serialized PDF length.
     const byteRangePlaceholder = `/ByteRange [0 ${"9".repeat(10)} ${"9".repeat(10)} ${"9".repeat(10)}]`;
@@ -236,47 +542,16 @@ export async function signPdf(
       "/Prop_Build << /Filter << /Name /Adobe.PPKLite >> /App << /Name /Garabato >> >>",
       ">>",
     ].join("\n");
-    const { context } = document;
-    const signatureRef = context.register(
+    const signatureRef = document.context.register(
       PDFInvalidObject.of(Buffer.from(signatureBody, "latin1")),
     );
-    const page = document.getPage(0);
-    const widget = context.register(
-      context.obj({
-        Type: "Annot",
-        Subtype: "Widget",
-        FT: "Sig",
-        Rect: [0, 0, 0, 0],
-        V: signatureRef,
-        T: PDFString.of(signatureName),
-        F: 4, // Print
-        P: page.ref,
-        // An empty appearance stream, required for PDF/A.
-        AP: {
-          N: context.register(
-            context.formXObject([], { BBox: [0, 0, 0, 0], Resources: {} }),
-          ),
-        },
-      }),
-    );
-    // lookupMaybe() resolves indirect arrays, so existing trees stay in place.
-    const annotations = page.node.lookupMaybe(PDFName.of("Annots"), PDFArray);
-    if (annotations) annotations.push(widget);
-    else page.node.set(PDFName.of("Annots"), context.obj([widget]));
-    let form = document.catalog.lookupMaybe(PDFName.of("AcroForm"), PDFDict);
-    if (!form) {
-      form = context.obj({});
-      document.catalog.set(PDFName.of("AcroForm"), context.register(form));
-    }
-    const fields = form.lookupMaybe(PDFName.of("Fields"), PDFArray);
-    if (fields) fields.push(widget);
-    else form.set(PDFName.of("Fields"), context.obj([widget]));
-    // Add SignaturesExist (1) and AppendOnly (2) to any existing flags.
-    const flags = form.lookupMaybe(PDFName.of("SigFlags"), PDFNumber);
-    form.set(
-      PDFName.of("SigFlags"),
-      PDFNumber.of((flags?.asNumber() ?? 0) | 3),
-    );
+    await addSignatureWidget(document, {
+      box,
+      pageIndex: placement?.page ?? 0,
+      signer: certificate.info.signer,
+      time: signingTime,
+      value: signatureRef,
+    });
     const prepared = Buffer.from(
       await document.save({ useObjectStreams: false }),
     );

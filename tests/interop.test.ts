@@ -1,8 +1,14 @@
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { PDFDocument } from "@cantoo/pdf-lib";
+import { PDFDocument, PDFName, PDFNumber } from "@cantoo/pdf-lib";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { inspectCertificate, inspectPdf, signPdf } from "../src/main/signing";
 import { type FnmtIdentity, fnmtIdentity } from "./support/fnmt";
@@ -61,6 +67,42 @@ function pyhanko(path: string, root: string): string {
   ]).output;
 }
 
+/** Poppler pdftoppm: renders page one as displayed, one gray pixel per point. */
+function render(path: string): {
+  width: number;
+  shade: (x: number, y: number) => number;
+} {
+  const prefix = join(folder, `render-${fileCount}`);
+  const result = run("pdftoppm", [
+    "-gray",
+    "-r",
+    "72",
+    "-singlefile",
+    path,
+    prefix,
+  ]);
+  expect(result.code, result.output).toBe(0);
+  const image = readFileSync(`${prefix}.pgm`);
+  const header = image
+    .toString("latin1", 0, 32)
+    .match(/^P5\s+(\d+)\s+(\d+)\s+255\s/);
+  if (!header) throw new Error("pdftoppm did not write a PGM image");
+  const width = Number(header[1]);
+  const pixels = image.subarray(header[0].length);
+  return { width, shade: (x, y) => pixels[y * width + x] };
+}
+
+/** Mean shade of a region: 0 is black, 255 is white. */
+function meanShade(
+  shade: (x: number, y: number) => number,
+  [left, top, right, bottom]: number[],
+): number {
+  let total = 0;
+  for (let y = top; y < bottom; y += 1)
+    for (let x = left; x < right; x += 1) total += shade(x, y);
+  return total / ((right - left) * (bottom - top));
+}
+
 async function simplePdf(): Promise<Buffer> {
   const document = await PDFDocument.create();
   document.addPage().drawText("Disposable interoperability fixture");
@@ -109,6 +151,39 @@ describe("independent PDF reader interoperability", () => {
     );
     expect(pyhanko(path, identity.root)).toMatch(/:VALID$/m);
   });
+
+  it.each([90, 270])(
+    "shows an upright visible box on a page rotated %i degrees and keeps it valid",
+    async (rotation) => {
+      const document = await PDFDocument.create();
+      const page = document.addPage([600, 400]);
+      page.drawText("Disposable rotated fixture", { x: 60, y: 60 });
+      page.node.set(PDFName.of("Rotate"), PDFNumber.of(rotation));
+      // Displayed 400 x 600: the box spans x 40 to 240 and y 120 to 210.
+      const placement = { page: 0, x: 0.1, y: 0.2, width: 0.5, height: 0.15 };
+      const path = writePdf(
+        await signPdf(
+          Buffer.from(await document.save()),
+          identity.p12,
+          password,
+          placement,
+        ),
+      );
+      const result = pdfsig(path, trusted);
+      expect(result).toContain("Total document signed");
+      expect(result).toContain("Signature is Valid.");
+      expect(pyhanko(path, identity.root)).toMatch(/:VALID$/m);
+
+      const { width, shade } = render(path);
+      expect(width).toBe(400);
+      // The dark bar is on the left edge of the box as displayed.
+      expect(meanShade(shade, [41, 125, 45, 205])).toBeLessThan(80);
+      expect(meanShade(shade, [232, 125, 238, 205])).toBeGreaterThan(230);
+      // The signer name is drawn inside the box, and nothing outside it.
+      expect(meanShade(shade, [50, 125, 230, 205])).toBeLessThan(250);
+      expect(meanShade(shade, [250, 120, 380, 210])).toBeGreaterThan(254);
+    },
+  );
 
   it("validates a signed AcroForm and keeps its field value", async () => {
     const document = await PDFDocument.create();
