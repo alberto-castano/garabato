@@ -30,6 +30,9 @@ These pieces replace dependencies that were unmaintained, vulnerable, or patched
   pkijs alone opens only PBES2 files. Older Windows and OpenSSL exports use the legacy SHA-1 3DES and RC2 algorithms.
   The appendix B key derivation is tested against published Bouncy Castle vectors.
 - `src/main/rc2.ts`: RC2-CBC decryption (RFC 2268). Node's OpenSSL 3 default provider has no RC2. Tests use OpenSSL `enc` ciphertexts.
+- `native/keychain/main.swift`: the macOS Keychain helper. It uses only the Security and CryptoKit system frameworks and adds no package.
+  It lists identities, builds their local chain without network fetches, and signs with `SecKeyCreateSignature` (RSA PKCS#1 v1.5, SHA-256).
+  Test-only request fields select one keychain file and disable prompts; they use deprecated `SecKeychain` calls, which are still available.
 - The signature placeholder in `src/main/signing.ts`: a `/Sig` dictionary with `adbe.pkcs7.detached`, an invisible widget, and AcroForm `SigFlags` 3.
   The dictionary is written as fixed bytes, so the byte range and signature slot are at known offsets.
 
@@ -55,6 +58,8 @@ and patches only that object's byte range and signature slot. All replacements k
 - Byte-range selection when another object contains literal `/ByteRange` text.
 - OpenSSL PKCS#12 exports: default AES, `-legacy`, 3DES-only, and unencrypted certificates, with a non-ASCII password.
 - KDF and RC2 known-answer vectors, and the iteration limit.
+- Keychain signing against a temporary keychain: listing, independent signature checks, a locked keychain, a refused key, and an identity removed after listing.
+  A stand-in helper covers cancellation and the other failure codes, because a test cannot answer a macOS prompt.
 
 On 2026-10-16, Poppler `pdfsig` also reported valid, whole-document signatures for AES and legacy containers. It is not part of the test suite.
 

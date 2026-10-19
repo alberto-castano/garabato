@@ -71,6 +71,9 @@ Garabato writes a complete new file, not an incremental update. Repaired inputs 
 | Certificate chain in the PKCS#12 | Embedded in the signature; not validated |
 | Signer outside its validity dates | Rejected |
 | EC keys, unencrypted keys, several keys | Rejected |
+| macOS Keychain identity with an RSA key and a valid certificate | Supported; macOS asks before each use it has not allowed |
+| Keychain identity with an EC key | Not listed |
+| Smart-card and token identities | Not tested ([#17](https://github.com/alberto-castano/garabato/issues/17)) |
 
 ## Manual checks
 
