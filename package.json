@@ -7,8 +7,9 @@
   "main": "out/main/index.js",
   "packageManager": "bun@1.4.0",
   "scripts": {
-    "dev": "electron-vite dev",
-    "build": "electron-vite build",
+    "dev": "sh scripts/build-keychain.sh && electron-vite dev",
+    "build": "sh scripts/build-keychain.sh && electron-vite build",
+    "build:keychain": "sh scripts/build-keychain.sh",
     "start": "electron-vite preview",
     "typecheck": "tsc --noEmit",
     "lint": "biome check .",
