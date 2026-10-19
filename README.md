@@ -7,7 +7,8 @@ See the [development roadmap](docs/ROADMAP.md) for prioritized issues, acceptanc
 ## First milestone
 
 - Choose an unsigned PDF and an RSA `.p12` or `.pfx` certificate, or an RSA identity in the macOS Keychain.
-- Unlock the certificate file, or select the Keychain identity, and review its identity before signing.
+- Preview the PDF pages locally. Optionally place a visible signature box on one page.
+- Unlock the certificate file, or select the Keychain identity. Review the final page preview and the certificate identity before signing.
 - Add a detached SHA-256/RSA CMS signature and save a new PDF.
 - Keep the original file unchanged. Existing destinations are never overwritten.
 - Clear certificate data after a successful save, session reset, or window close.
@@ -71,7 +72,8 @@ Packaging ([#11](https://github.com/alberto-castano/garabato/issues/11)) must co
 
 This is a local signing milestone, not a complete AutoFirma replacement.
 It rejects encrypted PDFs, XFA forms, PDFs with existing signatures, invalid certificate dates, and unsupported key containers.
-It does not provide a visible signature stamp, certificate trust validation, revocation checks, timestamps, or full PAdES validation.
+It does not provide certificate trust validation, revocation checks, timestamps, or full PAdES validation.
+The visible box uses Helvetica: characters outside Windows Latin-1 show as `?`. It has no image or handwritten signature.
 Windows certificate stores, DNIe, smart cards, hardware tokens, XAdES, CAdES, batch signing, and `afirma://` website integration are not implemented.
 
 The certificate file password is retained in main-process memory until the certificate is cleared. It is never written to application storage.
@@ -85,7 +87,10 @@ The native development build and Adobe Acrobat validation were checked manually 
 ## Architecture
 
 The React renderer uses a narrow preload API. Electron owns native dialogs, file access, and signing.
-The renderer receives document and certificate metadata, never private-key bytes or unrestricted filesystem APIs.
+The renderer receives a copy of the chosen PDF for preview, and certificate metadata. It never receives private-key bytes or unrestricted filesystem APIs.
+pdf.js renders pages in the sandboxed renderer and a bundled worker. Preview data does not leave the computer.
+The renderer sends only the box position: the page and fractions of the displayed page. The main process checks it, draws the box, and signs.
+For the final preview, the main process draws the box into an unsigned copy, and pdf.js renders that copy.
 Keychain identities reach the renderer as public metadata and a random reference. The reference is valid until the next listing or session reset.
 Context isolation and sandboxing are enabled. Navigation, new windows, and permission requests are blocked.
 

@@ -4,6 +4,7 @@ import {
   type CertificateProvider,
   inspectPdf,
   openPkcs12,
+  previewBox,
   signPdf,
 } from "../src/main/signing";
 
@@ -11,6 +12,7 @@ function provider(subject: string): CertificateProvider {
   return {
     info: {
       subject,
+      signer: subject,
       issuer: "Test issuer",
       validFrom: "2026-01-01T00:00:00.000Z",
       validTo: "2030-01-01T00:00:00.000Z",
@@ -23,12 +25,15 @@ function provider(subject: string): CertificateProvider {
   };
 }
 
-vi.mock("../src/main/signing", () => ({
+vi.mock("../src/main/signing", async (importOriginal) => ({
+  parsePlacement: (await importOriginal<typeof import("../src/main/signing")>())
+    .parsePlacement,
   inspectPdf: vi.fn(async () => ({ pageCount: 1 })),
   openPkcs12: vi.fn((p12: Buffer) => ({
     ...provider("Test signer"),
     clear: () => p12.fill(0),
   })),
+  previewBox: vi.fn(async () => Buffer.from("preview")),
   signPdf: vi.fn(async () => Buffer.from("signed")),
 }));
 beforeEach(() => vi.clearAllMocks());
@@ -77,6 +82,7 @@ it("requires an unlocked certificate and clears it after reset", async () => {
   expect(signPdf).toHaveBeenCalledWith(
     Buffer.from("pdf"),
     expect.objectContaining({ signer: Buffer.from("Test signer") }),
+    null,
   );
   session.reset();
   expect(secret.every((byte) => byte === 0)).toBe(true);
@@ -111,11 +117,19 @@ it("gives the renderer opaque Keychain references and signs with the chosen one"
     expect(id).not.toContain("First");
   }
   expect(Object.keys(listed[0]).sort()).toEqual(
-    ["id", "subject", "issuer", "validFrom", "validTo", "fingerprint"].sort(),
+    [
+      "id",
+      "subject",
+      "signer",
+      "issuer",
+      "validFrom",
+      "validTo",
+      "fingerprint",
+    ].sort(),
   );
   expect(session.selectKeychainIdentity(listed[1].id).subject).toBe("Second");
   await session.sign();
-  expect(signPdf).toHaveBeenCalledWith(Buffer.from("pdf"), second);
+  expect(signPdf).toHaveBeenCalledWith(Buffer.from("pdf"), second, null);
 });
 
 it("rejects unknown, stale, and closed-session Keychain references", () => {
@@ -142,4 +156,37 @@ it("clears the current certificate when the user lists the Keychain", async () =
   session.setKeychainIdentities([]);
   expect(secret.every((byte) => byte === 0)).toBe(true);
   await expect(session.sign()).rejects.toThrow("certificate first");
+});
+
+it("previews and signs with a checked placement and the unlocked signer", async () => {
+  const session = new SigningSession();
+  const placement = { page: 0, x: 0.1, y: 0.1, width: 0.3, height: 0.1 };
+  await session.setDocument("input.pdf", Buffer.from("pdf"));
+  session.setCertificate(Buffer.from("p12"));
+  await expect(session.preview(placement)).rejects.toThrow("certificate first");
+  session.unlock("");
+  await expect(session.preview(null)).rejects.toThrow(
+    "Place the signature box",
+  );
+  await expect(session.preview({ ...placement, x: 0.9 })).rejects.toThrow(
+    "inside the page",
+  );
+  await session.preview(placement);
+  expect(previewBox).toHaveBeenCalledWith(
+    Buffer.from("pdf"),
+    placement,
+    "Test signer",
+  );
+  await expect(session.sign({ ...placement, width: -1 })).rejects.toThrow(
+    "inside the page",
+  );
+  expect(signPdf).not.toHaveBeenCalled();
+  await session.sign({ ...placement, extra: "ignored" });
+  expect(signPdf).toHaveBeenCalledWith(
+    Buffer.from("pdf"),
+    expect.objectContaining({ signer: Buffer.from("Test signer") }),
+    placement,
+  );
+  session.clearCertificate();
+  await expect(session.preview(placement)).rejects.toThrow("certificate first");
 });

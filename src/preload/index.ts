@@ -8,7 +8,9 @@ const api: GarabatoApi = {
     ipcRenderer.invoke("certificate:unlock", password),
   listKeychainIdentities: () => ipcRenderer.invoke("keychain:list"),
   selectKeychainIdentity: (id) => ipcRenderer.invoke("keychain:select", id),
-  signAndSave: () => ipcRenderer.invoke("document:sign"),
+  previewSignature: (placement) =>
+    ipcRenderer.invoke("document:preview", placement),
+  signAndSave: (placement) => ipcRenderer.invoke("document:sign", placement),
   reset: () => ipcRenderer.invoke("session:reset"),
 };
 

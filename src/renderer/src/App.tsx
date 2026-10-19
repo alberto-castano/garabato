@@ -10,7 +10,9 @@ import {
   PenLineIcon,
   ShieldCheckIcon,
 } from "lucide-react";
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { DocumentPreview } from "@/components/document-preview";
+import { SignatureReview } from "@/components/signature-review";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -38,11 +40,13 @@ import {
 } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import { Separator } from "@/components/ui/separator";
+import { openPdf, type PDFDocumentProxy } from "@/lib/pdf";
 import type {
   CertificateInfo,
   DocumentInfo,
   GarabatoApi,
   KeychainIdentity,
+  Placement,
   Result,
   SignedFile,
 } from "../../shared/contracts";
@@ -70,8 +74,28 @@ export function App({ api = window.garabato }: { api?: GarabatoApi }) {
   const [error, setError] = useState<string | null>(null);
   const [working, setWorking] = useState<string | null>(null);
   const [saved, setSaved] = useState<SignedFile | null>(null);
+  const [pdf, setPdf] = useState<PDFDocumentProxy | null>(null);
+  // A new key resets page and zoom when another PDF opens.
+  const [pdfKey, setPdfKey] = useState(0);
+  const [placement, setPlacement] = useState<Placement | null>(null);
+  const [review, setReview] = useState<{
+    preview: PDFDocumentProxy | null;
+  } | null>(null);
   const inFlight = useRef(false);
   const disabled = Boolean(working) || !api;
+
+  useEffect(
+    () => () => {
+      void pdf?.loadingTask.destroy();
+    },
+    [pdf],
+  );
+  useEffect(
+    () => () => {
+      void review?.preview?.loadingTask.destroy();
+    },
+    [review],
+  );
 
   async function run(label: string, operation: () => Promise<void>) {
     if (inFlight.current) return;
@@ -97,7 +121,13 @@ export function App({ api = window.garabato }: { api?: GarabatoApi }) {
     void run("Reading PDF…", async () => {
       const chosen = unwrap(await api.choosePdf());
       if (chosen) {
-        setDocument(chosen);
+        const { data, ...info } = chosen;
+        // Signing does not need the preview, so a pdf.js failure is not fatal.
+        const opened = await openPdf(data).catch(() => null);
+        setDocument(info);
+        setPdf(opened);
+        setPdfKey((key) => key + 1);
+        setPlacement(null);
         setSaved(null);
       }
     });
@@ -154,6 +184,18 @@ export function App({ api = window.garabato }: { api?: GarabatoApi }) {
     });
   }
 
+  function startReview() {
+    if (!api) return;
+    void run("Preparing the final preview…", async () => {
+      const preview = placement
+        ? await openPdf(unwrap(await api.previewSignature(placement))).catch(
+            () => null,
+          )
+        : null;
+      setReview({ preview });
+    });
+  }
+
   function sign() {
     if (!api) return;
     void run(
@@ -161,8 +203,9 @@ export function App({ api = window.garabato }: { api?: GarabatoApi }) {
         ? "Signing and saving… macOS may ask you to allow access to the key."
         : "Signing and saving…",
       async () => {
-        const result = unwrap(await api.signAndSave());
+        const result = unwrap(await api.signAndSave(placement));
         if (result) {
+          setReview(null);
           setSaved(result);
           setCertificate(null);
           setCertificateFile(null);
@@ -178,6 +221,9 @@ export function App({ api = window.garabato }: { api?: GarabatoApi }) {
     if (!api) return;
     void run("Clearing session…", async () => {
       unwrap(await api.reset());
+      setReview(null);
+      setPlacement(null);
+      setPdf(null);
       setDocument(null);
       setCertificate(null);
       setCertificateFile(null);
@@ -278,6 +324,15 @@ export function App({ api = window.garabato }: { api?: GarabatoApi }) {
               </p>
             </CardFooter>
           </Card>
+        ) : review && certificate ? (
+          <SignatureReview
+            preview={review.preview}
+            placement={placement}
+            certificate={certificate}
+            disabled={disabled}
+            onBack={() => setReview(null)}
+            onSign={sign}
+          />
         ) : (
           <div className="grid items-start gap-5 lg:grid-cols-[1.1fr_1fr]">
             <Card>
@@ -290,31 +345,65 @@ export function App({ api = window.garabato }: { api?: GarabatoApi }) {
                 </CardDescription>
               </CardHeader>
               <CardContent>
-                <Empty className="min-h-64 border">
-                  <EmptyHeader>
-                    <EmptyMedia variant="icon">
-                      <FileTextIcon />
-                    </EmptyMedia>
-                    <EmptyTitle>
-                      {document?.name ?? "Start with a PDF"}
-                    </EmptyTitle>
-                    <EmptyDescription>
-                      {document
-                        ? `${document.pageCount} ${document.pageCount === 1 ? "page" : "pages"} · ${formatBytes(document.bytes)}`
-                        : "Choose the document you want to sign. We’ll save a separate signed copy."}
-                    </EmptyDescription>
-                  </EmptyHeader>
-                  <EmptyContent>
-                    <Button
-                      variant={document ? "outline" : "default"}
-                      onClick={choosePdf}
-                      disabled={disabled}
-                    >
-                      <FolderOpenIcon data-icon="inline-start" />
-                      {document ? "Change PDF" : "Choose PDF"}
-                    </Button>
-                  </EmptyContent>
-                </Empty>
+                {document ? (
+                  <div className="flex flex-col gap-4">
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <div className="flex min-w-0 flex-col gap-1">
+                        <p className="break-all font-medium">{document.name}</p>
+                        <p className="text-sm text-muted-foreground">
+                          {document.pageCount}{" "}
+                          {document.pageCount === 1 ? "page" : "pages"} ·{" "}
+                          {formatBytes(document.bytes)}
+                        </p>
+                      </div>
+                      <Button
+                        variant="outline"
+                        onClick={choosePdf}
+                        disabled={disabled}
+                      >
+                        <FolderOpenIcon data-icon="inline-start" />
+                        Change PDF
+                      </Button>
+                    </div>
+                    {pdf ? (
+                      <DocumentPreview
+                        key={pdfKey}
+                        pdf={pdf}
+                        pageCount={document.pageCount}
+                        placement={placement}
+                        disabled={disabled}
+                        onPlacementChange={setPlacement}
+                      />
+                    ) : (
+                      <Alert>
+                        <AlertTitle>Preview is not available</AlertTitle>
+                        <AlertDescription>
+                          This PDF cannot be shown here. You can still sign it
+                          without a visible box.
+                        </AlertDescription>
+                      </Alert>
+                    )}
+                  </div>
+                ) : (
+                  <Empty className="min-h-64 border">
+                    <EmptyHeader>
+                      <EmptyMedia variant="icon">
+                        <FileTextIcon />
+                      </EmptyMedia>
+                      <EmptyTitle>Start with a PDF</EmptyTitle>
+                      <EmptyDescription>
+                        Choose the document you want to sign. We’ll save a
+                        separate signed copy.
+                      </EmptyDescription>
+                    </EmptyHeader>
+                    <EmptyContent>
+                      <Button onClick={choosePdf} disabled={disabled}>
+                        <FolderOpenIcon data-icon="inline-start" />
+                        Choose PDF
+                      </Button>
+                    </EmptyContent>
+                  </Empty>
+                )}
               </CardContent>
               <CardFooter>
                 <p className="text-sm text-muted-foreground">
@@ -470,24 +559,26 @@ export function App({ api = window.garabato }: { api?: GarabatoApi }) {
           </div>
         )}
 
-        {!saved && (
+        {!saved && !review && (
           <section
             aria-label="Sign document"
             className="flex flex-wrap items-center justify-between gap-5 rounded-xl border bg-card p-5"
           >
             <div className="flex max-w-xl flex-col gap-1">
-              <h2 className="font-medium">03 / Sign and save a copy</h2>
+              <h2 className="font-medium">03 / Review and sign</h2>
               <p className="text-sm text-muted-foreground">
-                Add a digital signature without a visible stamp. Certificate
-                trust and revocation are not checked.
+                {placement
+                  ? `The signature box is on page ${placement.page + 1}.`
+                  : "No visible box: the signature is in the file, not on a page."}{" "}
+                Certificate trust and revocation are not checked.
               </p>
             </div>
             <Button
               size="lg"
               disabled={disabled || !document || !certificate}
-              onClick={sign}
+              onClick={startReview}
             >
-              Sign and save copy <ArrowRightIcon data-icon="inline-end" />
+              Review and sign <ArrowRightIcon data-icon="inline-end" />
             </Button>
           </section>
         )}
@@ -499,9 +590,11 @@ export function App({ api = window.garabato }: { api?: GarabatoApi }) {
           {working ??
             (saved
               ? "Your signed copy is ready."
-              : document && certificate
-                ? "Ready. Confirm the document and certificate, then sign."
-                : "Choose a document and unlock a certificate to continue.")}
+              : review
+                ? "Check the final preview, then sign."
+                : document && certificate
+                  ? "Ready. Confirm the document and certificate, then sign."
+                  : "Choose a document and a certificate to continue.")}
         </p>
       </main>
       <footer className="flex flex-col gap-5 pb-6">

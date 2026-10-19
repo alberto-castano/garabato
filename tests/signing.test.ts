@@ -4,21 +4,28 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  decodePDFRawStream,
   PDFArray,
   PDFDict,
   PDFDocument,
   PDFName,
   PDFNumber,
+  type PDFRawStream,
+  PDFRef,
+  PDFStream,
   PDFString,
 } from "@cantoo/pdf-lib";
 import * as asn1js from "asn1js";
 import * as pkijs from "pkijs";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
+  boxGeometry,
   inspectPdf,
   MAX_P12_BYTES,
   MAX_PDF_BYTES,
   openPkcs12,
+  parsePlacement,
+  previewBox,
   signPdf,
 } from "../src/main/signing";
 
@@ -252,6 +259,7 @@ describe("local PDF signing", () => {
     expect(await inspectPdf(pdf)).toEqual({ pageCount: 1 });
     expect(openPkcs12(p12, password).info).toMatchObject({
       subject: "CN=Disposable test certificate",
+      signer: "Disposable test certificate",
       issuer: "CN=Disposable test certificate",
       fingerprint: expect.stringMatching(/^[a-f0-9]{64}$/),
     });
@@ -268,6 +276,118 @@ describe("local PDF signing", () => {
     const changed = Buffer.from(signed);
     changed[7] = changed[7] === 55 ? 54 : 55;
     expect(verifyWithOpenSsl(changed).valid).toBe(false);
+  });
+
+  describe("visible signature box", () => {
+    const placement = { page: 0, x: 0.1, y: 0.2, width: 0.4, height: 0.25 };
+
+    /** A 600 x 400 page whose crop box starts at (50, 30) and is 500 x 340. */
+    async function croppedPage(rotation: number): Promise<PDFDocument> {
+      const document = await PDFDocument.create();
+      const page = document.addPage([600, 400]);
+      page.setCropBox(50, 30, 500, 340);
+      // Set directly: pdf-lib refuses rotations that are not quarter turns.
+      page.node.set(PDFName.of("Rotate"), PDFNumber.of(rotation));
+      return document;
+    }
+
+    function widget(document: PDFDocument): PDFDict {
+      const annotations = document
+        .getPage(0)
+        .node.lookup(PDFName.of("Annots"), PDFArray);
+      return annotations.lookup(annotations.size() - 1, PDFDict);
+    }
+
+    it.each([
+      [0, [100, 217, 300, 302], [1, 0, 0, 1, 0, 0]],
+      [90, [150, 64, 275, 200], [0, 1, -1, 0, 0, 0]],
+      [180, [300, 98, 500, 183], [-1, 0, 0, -1, 0, 0]],
+      [270, [325, 200, 450, 336], [0, -1, 1, 0, 0, 0]],
+      // pdf.js ignores rotations that are not quarter turns.
+      [45, [100, 217, 300, 302], [1, 0, 0, 1, 0, 0]],
+    ])(
+      "maps the displayed box on a page rotated %i degrees",
+      async (rotation, rect, matrix) => {
+        const geometry = boxGeometry(await croppedPage(rotation), placement);
+        expect(geometry.rect.map((value) => Math.round(value))).toEqual(rect);
+        expect(geometry.matrix).toEqual(matrix);
+      },
+    );
+
+    it("signs a rotated page with an upright, covered appearance", async () => {
+      const document = await croppedPage(90);
+      const result = await signPdf(
+        Buffer.from(await document.save()),
+        openPkcs12(p12, password),
+        placement,
+      );
+      const verification = verifyWithOpenSsl(result);
+      expect(verification.valid, verification.error).toBe(true);
+      const output = await PDFDocument.load(result);
+      const annotation = widget(output);
+      expect(
+        annotation
+          .lookup(PDFName.of("Rect"), PDFArray)
+          .asArray()
+          .map((value) => Math.round((value as PDFNumber).asNumber())),
+      ).toEqual([150, 64, 275, 200]);
+      expect(annotation.get(PDFName.of("V"))).toBeInstanceOf(PDFRef);
+      const appearance = annotation
+        .lookup(PDFName.of("AP"), PDFDict)
+        .lookup(PDFName.of("N"), PDFStream) as PDFRawStream;
+      expect(
+        appearance.dict
+          .lookup(PDFName.of("Matrix"), PDFArray)
+          .asArray()
+          .map((value) => (value as PDFNumber).asNumber()),
+      ).toEqual([0, 1, -1, 0, 0, 0]);
+      // The appearance is in the signed bytes, so a changed box breaks the signature.
+      const offset = result.indexOf("/Matrix [ 0 1 -1 0 0 0 ]");
+      expect(offset).toBeGreaterThan(0);
+      const tampered = Buffer.from(result);
+      tampered.write("/Matrix [ 1 0 0 1 0 0 ]", offset, "latin1");
+      expect(verifyWithOpenSsl(tampered).valid).toBe(false);
+    });
+
+    it("previews the signer name, replacing characters Helvetica cannot encode", async () => {
+      const preview = await previewBox(pdf, placement, "Muñoz Łukasz");
+      const output = await PDFDocument.load(preview);
+      const annotation = widget(output);
+      // A preview has no signature value and is never a signed file.
+      expect(annotation.has(PDFName.of("V"))).toBe(false);
+      expect(preview.includes("/ByteRange")).toBe(false);
+      const appearance = annotation
+        .lookup(PDFName.of("AP"), PDFDict)
+        .lookup(PDFName.of("N"), PDFStream) as PDFRawStream;
+      const content = Buffer.from(
+        decodePDFRawStream(appearance).decode(),
+      ).toString("latin1");
+      const hex = (text: string) =>
+        Buffer.from(text, "latin1").toString("hex").toUpperCase();
+      expect(content).toContain(`<${hex("Digitally signed by")}>`);
+      expect(content).toContain(`<${hex("Muñoz ?ukasz")}>`);
+      expect(content).toMatch(/<[0-9A-F]+> Tj/);
+    });
+
+    it("rejects boxes outside the page or too small to read", async () => {
+      for (const value of [
+        "box",
+        { ...placement, page: -1 },
+        { ...placement, page: 0.5 },
+        { ...placement, x: Number.NaN },
+        { ...placement, x: 0.7 },
+        { ...placement, height: 1.1 },
+      ]) {
+        expect(() => parsePlacement(value)).toThrow("inside the page");
+      }
+      expect(parsePlacement(undefined)).toBeNull();
+      await expect(
+        signPdf(pdf, openPkcs12(p12, password), { ...placement, page: 1 }),
+      ).rejects.toThrow("inside the page");
+      await expect(
+        signPdf(pdf, openPkcs12(p12, password), { ...placement, height: 0.01 }),
+      ).rejects.toThrow("at least 72 by 24 points");
+    });
   });
 
   it("preserves form fields and flags stored as indirect objects", async () => {

@@ -8,6 +8,8 @@ import {
   type CertificateProvider,
   inspectPdf,
   openPkcs12,
+  parsePlacement,
+  previewBox,
   signPdf,
 } from "./signing";
 
@@ -94,11 +96,21 @@ export class SigningSession {
     return provider.info;
   }
 
-  async sign(): Promise<Buffer> {
+  async preview(placement: unknown): Promise<Buffer> {
+    const box = parsePlacement(placement);
     if (!this.pdf || !this.provider) {
       throw new Error("Choose a PDF and a certificate first.");
     }
-    return signPdf(this.pdf, this.provider);
+    if (!box) throw new Error("Place the signature box first.");
+    return previewBox(this.pdf, box, this.provider.info.signer);
+  }
+
+  async sign(placement: unknown = null): Promise<Buffer> {
+    const box = parsePlacement(placement);
+    if (!this.pdf || !this.provider) {
+      throw new Error("Choose a PDF and a certificate first.");
+    }
+    return signPdf(this.pdf, this.provider, box);
   }
 
   clearCertificate(): void {
